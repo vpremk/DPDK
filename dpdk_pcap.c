@@ -37,6 +37,8 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <pcap/pcap.h>
+#include <inttypes.h>
+#include <errno.h>
 
 /* ── Configuration ─────────────────────────────────────────────────── */
 #define MBUF_POOL_SIZE      4096           /* total packet buffers        */
@@ -206,14 +208,15 @@ typedef struct {
 } __attribute__((packed)) eth_hdr_t;
 
 typedef struct {
-    uint8_t  src_ip[4];
-    uint8_t  dst_ip[4];
-    uint8_t  proto;
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint16_t payload_len;
-    bool     is_fix;
-    char     fix_msg_type;   /* tag 35 */
+    uint8_t        src_ip[4];
+    uint8_t        dst_ip[4];
+    uint8_t        proto;
+    uint16_t       src_port;
+    uint16_t       dst_port;
+    uint16_t       payload_len;
+    bool           is_fix;
+    char           fix_msg_type;      /* tag 35                              */
+    const uint8_t *fix_payload;       /* pointer into mbuf — zero-copy       */
 } parsed_pkt_t;
 
 static bool parse_packet(const uint8_t *data, uint16_t len, parsed_pkt_t *out) {
@@ -247,7 +250,8 @@ static bool parse_packet(const uint8_t *data, uint16_t len, parsed_pkt_t *out) {
         const uint8_t *payload = (const uint8_t *)udp + sizeof(struct udphdr);
         uint16_t plen = out->payload_len;
         if (plen >= 7 && memcmp(payload, "8=FIX", 5) == 0) {
-            out->is_fix = true;
+            out->is_fix      = true;
+            out->fix_payload = payload;
             /* scan for tag 35= */
             for (int i = 0; i < (int)plen - 4; i++) {
                 if (payload[i]   == '\x01' &&
@@ -280,6 +284,109 @@ typedef struct {
 
 static stats_t g_stats;
 static volatile sig_atomic_t g_running = 1;
+
+/* ─────────────────────────────────────────────────────────────────────
+ * 6b. AUDIT LOG — one JSON line per captured FIX order
+ *
+ * Format (newline-delimited JSON):
+ * {"ts_utc":"2024-04-06T14:23:01.123456789Z","ts_ns":1234567890,
+ *  "seq":42,"msg_type":"NewOrderSingle","tag35":"D",
+ *  "cl_ord_id":"ORD000042","symbol":"AAPL","side":"Buy","qty":500,
+ *  "price":"123.45","src":"192.168.1.200:54321",
+ *  "dst":"192.168.1.165:4567","payload_len":180,"lat_ns":412}
+ * ───────────────────────────────────────────────────────────────────── */
+#define AUDIT_LOG_PATH "fix_audit.log"
+
+static FILE *g_audit_fp = NULL;
+
+/* Extract a FIX tag value (NUL-terminated) from payload.
+ * tag_str e.g. "\x0155=" — SOH prefix + tag number + '='.
+ * Returns pointer into payload on match, NULL if not found.          */
+static const char *fix_tag(const uint8_t *payload, uint16_t plen,
+                             const char *tag_with_soh, char *out, size_t outsz)
+{
+    out[0] = '\0';
+    size_t tlen = strlen(tag_with_soh);
+    for (int i = 0; i < (int)plen - (int)tlen; i++) {
+        if (memcmp(payload + i, tag_with_soh, tlen) == 0) {
+            /* value runs until next SOH or end of payload */
+            const uint8_t *v = payload + i + tlen;
+            size_t n = 0;
+            while ((size_t)(v - payload) + n < plen &&
+                   v[n] != '\x01' && n < outsz - 1)
+                n++;
+            memcpy(out, v, n);
+            out[n] = '\0';
+            return out;
+        }
+    }
+    return NULL;
+}
+
+static void audit_log_fix(const parsed_pkt_t *p,
+                           const uint8_t *payload, uint16_t plen,
+                           uint64_t rx_ns, uint64_t lat_ns,
+                           uint64_t seq)
+{
+    if (!g_audit_fp) return;
+
+    /* Wall-clock timestamp */
+    struct timespec wts;
+    clock_gettime(CLOCK_REALTIME, &wts);
+    char ts_buf[40];
+    struct tm tm_info;
+    gmtime_r(&wts.tv_sec, &tm_info);
+    strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%dT%H:%M:%S", &tm_info);
+
+    /* msg_type label */
+    const char *type_str = "Unknown";
+    switch (p->fix_msg_type) {
+        case 'D': type_str = "NewOrderSingle";      break;
+        case '8': type_str = "ExecutionReport";     break;
+        case 'G': type_str = "OrderCancelReplace";  break;
+        case 'F': type_str = "OrderCancelRequest";  break;
+        case 'V': type_str = "MarketDataRequest";   break;
+        case 'W': type_str = "MarketDataSnapshot";  break;
+    }
+
+    /* extract FIX tags — SOH (\x01) is the field delimiter.
+     * Use string concatenation ("\x01" "11=") to prevent the C compiler
+     * from treating the digit after \x01 as part of the hex sequence.  */
+    char cl_ord_id[32], symbol[16], side[4], qty[16], price[20];
+    fix_tag(payload, plen, "\x01" "11=", cl_ord_id, sizeof(cl_ord_id));
+    fix_tag(payload, plen, "\x01" "55=", symbol,    sizeof(symbol));
+    fix_tag(payload, plen, "\x01" "54=", side,      sizeof(side));
+    fix_tag(payload, plen, "\x01" "38=", qty,       sizeof(qty));
+    fix_tag(payload, plen, "\x01" "44=", price,     sizeof(price));
+
+    /* side code → human label */
+    const char *side_label = strcmp(side, "1") == 0 ? "Buy"  :
+                             strcmp(side, "2") == 0 ? "Sell" : side;
+
+    fprintf(g_audit_fp,
+        "{\"ts_utc\":\"%s.%09ldZ\","
+        "\"ts_ns\":%" PRIu64 ","
+        "\"seq\":%" PRIu64 ","
+        "\"msg_type\":\"%s\","
+        "\"tag35\":\"%c\","
+        "\"cl_ord_id\":\"%s\","
+        "\"symbol\":\"%s\","
+        "\"side\":\"%s\","
+        "\"qty\":\"%s\","
+        "\"price\":\"%s\","
+        "\"src\":\"%d.%d.%d.%d:%d\","
+        "\"dst\":\"%d.%d.%d.%d:%d\","
+        "\"payload_len\":%d,"
+        "\"lat_ns\":%" PRIu64 "}\n",
+        ts_buf, wts.tv_nsec,
+        rx_ns, seq,
+        type_str, p->fix_msg_type,
+        cl_ord_id, symbol, side_label, qty, price,
+        p->src_ip[0], p->src_ip[1], p->src_ip[2], p->src_ip[3], p->src_port,
+        p->dst_ip[0], p->dst_ip[1], p->dst_ip[2], p->dst_ip[3], p->dst_port,
+        plen, lat_ns);
+    fflush(g_audit_fp);   /* flush every line — audit must not buffer        */
+}
 
 static void stats_print(void) {
     static uint64_t last_rx  = 0;
@@ -402,21 +509,55 @@ static void process_burst(mempool_t *pool, mbuf_t **mbufs, int n) {
 
         /* classify */
         if (parsed.is_fix) {
-            atomic_fetch_add(&g_stats.fix_orders, 1);
-            char type_str[32] = "Unknown";
-            switch (parsed.fix_msg_type) {
-                case 'D': strcpy(type_str, "NewOrderSingle"); break;
-                case '8': strcpy(type_str, "ExecutionReport"); break;
-                case 'G': strcpy(type_str, "OrderCancelReplace"); break;
-                case 'F': strcpy(type_str, "OrderCancelRequest"); break;
+            uint64_t fix_seq = atomic_fetch_add(&g_stats.fix_orders, 1) + 1;
+            uint64_t lat_ns  = (m->timestamp_ns > 0 && now >= m->timestamp_ns)
+                               ? now - m->timestamp_ns : 0;
+
+            /* extract key FIX tags for console + audit */
+            char cl_ord_id[32] = "-", symbol[16] = "-";
+            char side_raw[4]   = "-", qty[16]    = "-", price[20] = "-";
+            if (parsed.fix_payload) {
+                fix_tag(parsed.fix_payload, parsed.payload_len,
+                        "\x01" "11=", cl_ord_id, sizeof(cl_ord_id));
+                fix_tag(parsed.fix_payload, parsed.payload_len,
+                        "\x01" "55=", symbol,    sizeof(symbol));
+                fix_tag(parsed.fix_payload, parsed.payload_len,
+                        "\x01" "54=", side_raw,  sizeof(side_raw));
+                fix_tag(parsed.fix_payload, parsed.payload_len,
+                        "\x01" "38=", qty,       sizeof(qty));
+                fix_tag(parsed.fix_payload, parsed.payload_len,
+                        "\x01" "44=", price,     sizeof(price));
             }
-            printf(GRN "  [FIX] %s (35=%c) UDP %d.%d.%d.%d:%d → %d.%d.%d.%d:%d\n"
-                   RST,
-                   type_str, parsed.fix_msg_type,
+            const char *side_label = strcmp(side_raw,"1")==0 ? "Buy"  :
+                                     strcmp(side_raw,"2")==0 ? "Sell" : side_raw;
+            const char *type_str   = "Unknown";
+            switch (parsed.fix_msg_type) {
+                case 'D': type_str = "NewOrderSingle";     break;
+                case '8': type_str = "ExecutionReport";    break;
+                case 'G': type_str = "OrderCancelReplace"; break;
+                case 'F': type_str = "OrderCancelRequest"; break;
+                case 'V': type_str = "MktDataRequest";     break;
+                case 'W': type_str = "MktDataSnapshot";    break;
+            }
+
+            /* ── console audit line ── */
+            printf(GRN
+                   "  [AUDIT #%5" PRIu64 "] %-20s | clOrdID=%-12s"
+                   " sym=%-6s %s qty=%-6s px=%-9s"
+                   " | %d.%d.%d.%d → %d.%d.%d.%d | lat=%" PRIu64 "ns\n" RST,
+                   fix_seq, type_str,
+                   cl_ord_id, symbol, side_label, qty, price,
                    parsed.src_ip[0], parsed.src_ip[1],
-                   parsed.src_ip[2], parsed.src_ip[3], parsed.src_port,
+                   parsed.src_ip[2], parsed.src_ip[3],
                    parsed.dst_ip[0], parsed.dst_ip[1],
-                   parsed.dst_ip[2], parsed.dst_ip[3], parsed.dst_port);
+                   parsed.dst_ip[2], parsed.dst_ip[3],
+                   lat_ns);
+
+            /* ── structured audit log (NDJSON, flushed per line) ── */
+            audit_log_fix(&parsed,
+                          parsed.fix_payload, parsed.payload_len,
+                          m->timestamp_ns, lat_ns, fix_seq);
+
         } else if (parsed.proto == IPPROTO_UDP) {
             /* non-FIX UDP — market data feed etc */
         }
@@ -455,6 +596,15 @@ int main(int argc, char *argv[]) {
 
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
+
+    /* ── Audit log ───────────────────────────────────────────────── */
+    g_audit_fp = fopen(AUDIT_LOG_PATH, "a");
+    if (!g_audit_fp) {
+        fprintf(stderr, YLW "[WARN] Cannot open audit log %s: %s\n" RST,
+                AUDIT_LOG_PATH, strerror(errno));
+    } else {
+        printf("[audit] Logging FIX orders → %s\n", AUDIT_LOG_PATH);
+    }
 
     /* ── Init subsystems ──────────────────────────────────────────── */
     printf("\n[EAL] Initialising subsystems...\n");
@@ -545,6 +695,11 @@ int main(int argc, char *argv[]) {
     free(pool->free_stack);
     free(pool);
     free(rx_ring);
+
+    if (g_audit_fp) {
+        fclose(g_audit_fp);
+        printf("[audit] Log written to %s\n", AUDIT_LOG_PATH);
+    }
 
     printf(CYN "\n═══════════════════════════════════════════════\n"
            "  Done.\n"

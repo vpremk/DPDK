@@ -17,7 +17,8 @@
       "Bash(echo \"exit=$?\")",
       "Bash(ls /Users/vamsi/aws/low_latency/*.py /Users/vamsi/aws/low_latency/Makefile /Users/vamsi/aws/low_latency/*.md)",
       "Bash(make build:*)",
-      "Bash(ipconfig getifaddr:*)"
+      "Bash(ipconfig getifaddr:*)",
+      "Bash(ls /Users/vamsi/aws/low_latency/*.c /Users/vamsi/aws/low_latency/*.sh)"
     ]
   }
 }
