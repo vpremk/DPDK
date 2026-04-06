@@ -20,6 +20,144 @@ kernel's TCP/IP stack is even involved.
 
 ---
 
+## How to Run — Step by Step
+
+### Prerequisites (both Macs)
+
+```bash
+# Clone / copy this repo to both machines
+git clone <repo> ~/aws/low_latency && cd ~/aws/low_latency
+
+# Python venv
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# Optional: compile proto stubs for full protobuf encoding
+pip install grpcio-tools
+python -m grpc_tools.protoc -I. --python_out=. market_data.proto
+```
+
+---
+
+### Mac B — Start First (Receiver + DPDK Capture)
+
+Mac B must be listening before Mac A sends anything.
+
+**Terminal 1 — Build and start the DPDK-style packet capture**
+
+```bash
+# Build (one-time)
+clang -O2 -Wall dpdk_pcap.c -lpcap -o dpdk_pcap
+
+# Live capture on en0 — intercepts both FIX (port 4567) and market data (port 5678)
+sudo ./dpdk_pcap en0
+```
+
+Expected output:
+```
+═══════════════════════════════════════════════
+  DPDK-Style Packet Processor — libpcap/macOS
+═══════════════════════════════════════════════
+[mempool] allocated 4096 mbufs
+[ring]    1024-slot SPSC ring ready
+[pcap]    filter: udp port 4567 or udp port 5678
+Waiting for packets on en0 …
+```
+
+**Terminal 2 — Optional: Python DPDK simulation (no sudo, software only)**
+
+```bash
+# Runs the full pipeline in Python: PMD → Ring → Parser → Risk → Stats
+source .venv/bin/activate
+python dpdk_sim.py
+```
+
+**Terminal 3 — Optional: market-data decoder (verify proto decoding)**
+
+```bash
+source .venv/bin/activate
+python send_market_data.py --mode decode --port 5678
+```
+
+---
+
+### Mac A — Send FIX Orders and Market Data
+
+Replace `192.168.1.165` with Mac B's actual `en0` IP (`ipconfig getifaddr en0` on Mac B).
+
+**Terminal 1 — Send FIX 4.2 orders (NewOrderSingle + CancelRequest)**
+
+```bash
+source .venv/bin/activate
+
+# 10 orders at 5/sec — default
+python send_fix_orders.py --dst 192.168.1.165
+
+# 500 orders at 50/sec with per-message print
+python send_fix_orders.py --dst 192.168.1.165 --count 500 --rate 50 --verbose
+
+# Max rate (stress test)
+python send_fix_orders.py --dst 192.168.1.165 --count 10000 --rate 0
+```
+
+**Terminal 2 — Send market data feed (NBBO / Trade / L2 Book)**
+
+```bash
+source .venv/bin/activate
+
+# Mixed feed: NBBO + Trade + Heartbeat at 10 msg/s
+python send_market_data.py --dst 192.168.1.165
+
+# NBBO only at 1000 msg/s
+python send_market_data.py --dst 192.168.1.165 --type nbbo --rate 1000 --count 5000
+
+# L2 book snapshots, 10 levels deep
+python send_market_data.py --dst 192.168.1.165 --type book --depth 10 --count 200
+
+# Incremental book deltas
+python send_market_data.py --dst 192.168.1.165 --type delta --count 1000 --rate 500
+```
+
+**Terminal 3 — RDMA latency benchmark (same machine, shared-mem simulation)**
+
+```bash
+source .venv/bin/activate
+python rdma_transport.py --mode bench --iters 50000
+```
+
+---
+
+### Audit Log (Mac B)
+
+`dpdk_pcap` appends every FIX decision to `audit_log.jsonl` in the working directory.
+
+```bash
+# Live tail on Mac B
+tail -f audit_log.jsonl | python -m json.tool
+
+# Count accepted vs rejected
+grep -c '"decision": "ACCEPTED"' audit_log.jsonl
+grep -c '"decision": "REJECTED"' audit_log.jsonl
+```
+
+---
+
+### Typical Terminal Layout
+
+```
+Mac A                               Mac B
+──────────────────────              ──────────────────────────────────────
+Terminal 1:                         Terminal 1:
+  python send_fix_orders.py    ──►    sudo ./dpdk_pcap en0
+                                        [FIX audit lines in green]
+                                        [MKTDATA lines in cyan]
+
+Terminal 2:                         Terminal 2:
+  python send_market_data.py   ──►    tail -f audit_log.jsonl
+```
+
+---
+
 ## End-to-End Swimlane
 
 ```mermaid
