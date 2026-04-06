@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import numpy, scipy; print\\('deps ok'\\)\")",
+      "Bash(pip3 install:*)",
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(brew list:*)",
+      "Read(//usr/**)",
+      "Bash(xcrun --show-sdk-path)",
+      "Bash(.venv/bin/python3 dpdk_sim.py)",
+      "Bash(python rdma_transport.py --mode bench --iters 1000)",
+      "Bash(python3 rdma_transport.py --mode bench --iters 1000)",
+      "Bash(.venv/bin/python rdma_transport.py --mode bench --iters 1000)",
+      "Bash(.venv/bin/python rdma_transport.py --mode bench --iters 10000)",
+      "Bash(./dpdk_pcap --offline nonexistent.pcap)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(ls /Users/vamsi/aws/low_latency/*.py /Users/vamsi/aws/low_latency/Makefile /Users/vamsi/aws/low_latency/*.md)",
+      "Bash(make build:*)",
+      "Bash(ipconfig getifaddr:*)"
+    ]
+  }
+}
