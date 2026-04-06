@@ -49,7 +49,43 @@
 #define PCAP_SNAPLEN        65535          /* capture full packet         */
 #define PCAP_TIMEOUT_MS     0              /* 0 = non-blocking poll mode  */
 #define FIX_PORT            4567           /* FIX-over-UDP port           */
+#define MKTDATA_PORT        5678           /* protobuf market-data port   */
 #define STATS_INTERVAL_SEC  1              /* print stats every N seconds */
+
+/* ── Market-data wire header (matches send_market_data.py) ──────────────
+ *   byte 0      : MsgType enum (1=NBBO 2=TRADE 3=BOOK 4=DELTA 7=HB)
+ *   bytes 1..4  : big-endian uint32  proto payload length
+ *   bytes 5..N  : serialised MarketDataEnvelope protobuf
+ * ─────────────────────────────────────────────────────────────────────── */
+#define MKTDATA_HEADER_SIZE 5
+
+typedef enum {
+    MKTDATA_UNKNOWN  = 0,
+    MKTDATA_NBBO     = 1,
+    MKTDATA_TRADE    = 2,
+    MKTDATA_BOOK     = 3,
+    MKTDATA_DELTA    = 4,
+    MKTDATA_IMBAL    = 5,
+    MKTDATA_STATUS   = 6,
+    MKTDATA_HB       = 7,
+} mktdata_msg_type_t;
+
+static const char *mktdata_type_str(uint8_t t) {
+    switch (t) {
+        case MKTDATA_NBBO:  return "NBBO ";
+        case MKTDATA_TRADE: return "TRADE";
+        case MKTDATA_BOOK:  return "BOOK ";
+        case MKTDATA_DELTA: return "DELTA";
+        case MKTDATA_IMBAL: return "IMBAL";
+        case MKTDATA_STATUS:return "STAT ";
+        case MKTDATA_HB:    return "HB   ";
+        default:            return "?????";
+    }
+}
+
+/* Counters for market-data stats */
+static _Atomic uint64_t g_mktdata_pkts  = 0;
+static _Atomic uint64_t g_mktdata_bytes = 0;
 
 /* ── Colour output ──────────────────────────────────────────────────── */
 #define GRN  "\033[0;32m"
@@ -558,8 +594,57 @@ static void process_burst(mempool_t *pool, mbuf_t **mbufs, int n) {
                           parsed.fix_payload, parsed.payload_len,
                           m->timestamp_ns, lat_ns, fix_seq);
 
+        } else if (parsed.proto == IPPROTO_UDP &&
+                   parsed.dst_port == MKTDATA_PORT) {
+            /* ── Market-data feed (protobuf on port 5678) ────────────────
+             *
+             * Wire format from send_market_data.py:
+             *   [0]      uint8   MsgType  (mktdata_msg_type_t)
+             *   [1..4]   uint32  big-endian proto payload length
+             *   [5..N]   bytes   serialised MarketDataEnvelope protobuf
+             *
+             * We decode the 5-byte header here in the fast path.
+             * Full protobuf deserialisation (nanopb) would follow in a
+             * dedicated worker thread to keep this rx loop zero-copy.
+             * ─────────────────────────────────────────────────────────── */
+            const uint8_t *pay = parsed.fix_payload;  /* zero-copy ptr into mbuf */
+            uint16_t  paylen = parsed.payload_len;
+
+            if (paylen < MKTDATA_HEADER_SIZE) {
+                /* runt — drop silently */
+            } else {
+                uint8_t  msg_type  = pay[0];
+                uint32_t proto_len = ((uint32_t)pay[1] << 24) |
+                                     ((uint32_t)pay[2] << 16) |
+                                     ((uint32_t)pay[3] <<  8) |
+                                      (uint32_t)pay[4];
+
+                uint64_t recv_ns   = m->timestamp_ns;
+                uint64_t lat_ns    = recv_ns - m->timestamp_ns; /* wire→rx */
+
+                atomic_fetch_add(&g_mktdata_pkts,  1);
+                atomic_fetch_add(&g_mktdata_bytes, paylen);
+
+                printf(CYN
+                       "  [MKTDATA] %-5s | port=%u→%u"
+                       " | proto_len=%-5u | %d.%d.%d.%d → %d.%d.%d.%d"
+                       " | lat=%"PRIu64"ns\n" RST,
+                       mktdata_type_str(msg_type),
+                       parsed.src_port, parsed.dst_port,
+                       proto_len,
+                       parsed.src_ip[0], parsed.src_ip[1],
+                       parsed.src_ip[2], parsed.src_ip[3],
+                       parsed.dst_ip[0], parsed.dst_ip[1],
+                       parsed.dst_ip[2], parsed.dst_ip[3],
+                       lat_ns);
+
+                /* TODO: hand proto_bytes to nanopb worker thread:
+                 *   uint8_t *proto_bytes = pay + MKTDATA_HEADER_SIZE;
+                 *   nanopb_decode(msg_type, proto_bytes, proto_len);
+                 */
+            }
         } else if (parsed.proto == IPPROTO_UDP) {
-            /* non-FIX UDP — market data feed etc */
+            /* other UDP — silently counted in stats */
         }
 
         /* free mbuf back to pool (O(1) — no free()) */

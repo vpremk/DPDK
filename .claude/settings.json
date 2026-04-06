@@ -18,7 +18,9 @@
       "Bash(ls /Users/vamsi/aws/low_latency/*.py /Users/vamsi/aws/low_latency/Makefile /Users/vamsi/aws/low_latency/*.md)",
       "Bash(make build:*)",
       "Bash(ipconfig getifaddr:*)",
-      "Bash(ls /Users/vamsi/aws/low_latency/*.c /Users/vamsi/aws/low_latency/*.sh)"
+      "Bash(ls /Users/vamsi/aws/low_latency/*.c /Users/vamsi/aws/low_latency/*.sh)",
+      "Bash(clang -O2 -Wall dpdk_pcap.c -lpcap -o dpdk_pcap)",
+      "Bash(.venv/bin/python send_market_data.py --count 5 --rate 0 --verbose)"
     ]
   }
 }

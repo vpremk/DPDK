@@ -1,0 +1,211 @@
+// market_data.proto — UDP market data feed messages
+// =================================================
+// Serialised with protobuf and sent as raw UDP payload on port 5678.
+// dpdk_pcap detects these by port number and deserialises via nanopb (C)
+// or protobuf (Python).
+//
+// Compile (Python):
+//   pip install grpcio-tools
+//   python -m grpc_tools.protoc -I. --python_out=. market_data.proto
+//
+// Compile (C with nanopb):
+//   python nanopb/generator/nanopb_generator.py market_data.proto
+//   # produces market_data.pb.h + market_data.pb.c
+
+syntax = "proto3";
+
+package marketdata;
+
+// ── Feed types ─────────────────────────────────────────────────────────────
+
+// Message type discriminator — first byte on the wire (before protobuf bytes)
+// Lets the C parser dispatch without deserialising the full proto.
+enum MsgType {
+  MSG_UNKNOWN        = 0;
+  MSG_NBBO           = 1;   // National Best Bid/Offer update
+  MSG_TRADE          = 2;   // Last sale / trade print
+  MSG_ORDER_BOOK     = 3;   // Full L2 depth snapshot
+  MSG_ORDER_BOOK_DELTA = 4; // Incremental L2 update
+  MSG_IMBALANCE      = 5;   // Opening / closing auction imbalance
+  MSG_STATUS         = 6;   // Instrument / session status
+  MSG_HEARTBEAT      = 7;   // Feed health check
+}
+
+// ── NBBO — National Best Bid / Offer ───────────────────────────────────────
+
+message NBBOUpdate {
+  string   symbol        = 1;   // e.g. "AAPL"
+  uint64   exchange_ts   = 2;   // exchange timestamp, nanoseconds since epoch
+  uint64   recv_ts       = 3;   // local RX timestamp, ns (filled by dpdk_pcap)
+
+  double   bid_px        = 4;   // best bid price
+  uint32   bid_sz        = 5;   // bid size (shares)
+  string   bid_exch      = 6;   // bid exchange code e.g. "XNAS"
+
+  double   ask_px        = 7;   // best ask price
+  uint32   ask_sz        = 8;   // ask size (shares)
+  string   ask_exch      = 9;   // ask exchange code
+
+  double   mid           = 10;  // (bid + ask) / 2  — pre-computed by sender
+  double   spread        = 11;  // ask - bid
+
+  uint32   seq           = 12;  // feed sequence number
+  string   feed_id       = 13;  // feed identifier e.g. "SIP_UTP"
+}
+
+// ── Trade Print ────────────────────────────────────────────────────────────
+
+enum TradeSide {
+  SIDE_UNKNOWN = 0;
+  SIDE_BUY     = 1;
+  SIDE_SELL    = 2;
+}
+
+enum TradeCondition {
+  COND_REGULAR       = 0;
+  COND_OPENING       = 1;
+  COND_CLOSING       = 2;
+  COND_FORM_T        = 3;  // extended-hours
+  COND_INTERMARKET   = 4;
+  COND_ODD_LOT       = 5;
+}
+
+message TradePrint {
+  string         symbol        = 1;
+  uint64         exchange_ts   = 2;
+  uint64         recv_ts       = 3;
+
+  double         price         = 4;
+  uint32         size          = 5;   // shares
+  TradeSide      aggressor     = 6;   // which side was the aggressor
+  TradeCondition condition     = 7;
+  string         exchange      = 8;   // executing exchange
+
+  double         vwap          = 9;   // running VWAP at sender (optional)
+  uint64         cum_volume    = 10;  // cumulative day volume
+
+  uint32         seq           = 11;
+  string         feed_id       = 12;
+}
+
+// ── L2 Order Book — Full Snapshot ──────────────────────────────────────────
+
+message PriceLevel {
+  double   price  = 1;
+  uint32   size   = 2;   // aggregated shares at this price
+  uint32   orders = 3;   // number of resting orders (optional)
+}
+
+message OrderBookSnapshot {
+  string     symbol      = 1;
+  uint64     exchange_ts = 2;
+  uint64     recv_ts     = 3;
+
+  repeated PriceLevel bids = 4;  // sorted descending by price
+  repeated PriceLevel asks = 5;  // sorted ascending  by price
+
+  uint32     depth       = 6;   // levels captured (e.g. 10)
+  uint32     seq         = 7;
+  string     feed_id     = 8;
+}
+
+// ── L2 Order Book — Incremental Delta ──────────────────────────────────────
+
+enum BookSide {
+  BOOK_BID = 0;
+  BOOK_ASK = 1;
+}
+
+enum DeltaAction {
+  DELTA_ADD    = 0;  // new price level
+  DELTA_MODIFY = 1;  // size changed
+  DELTA_DELETE = 2;  // level removed
+}
+
+message OrderBookDelta {
+  string      symbol      = 1;
+  uint64      exchange_ts = 2;
+  uint64      recv_ts     = 3;
+
+  BookSide    side        = 4;
+  DeltaAction action      = 5;
+  double      price       = 6;
+  uint32      size        = 7;   // 0 if action=DELETE
+
+  uint32      seq         = 8;
+  string      feed_id     = 9;
+}
+
+// ── Auction Imbalance ───────────────────────────────────────────────────────
+
+enum ImbalanceSide {
+  IMBAL_NONE = 0;
+  IMBAL_BUY  = 1;
+  IMBAL_SELL = 2;
+}
+
+message AuctionImbalance {
+  string        symbol          = 1;
+  uint64        exchange_ts     = 2;
+  uint64        recv_ts         = 3;
+
+  double        ref_price       = 4;   // indicative clearing price
+  uint32        paired_qty      = 5;   // shares that would execute
+  uint32        imbalance_qty   = 6;   // unmatched shares
+  ImbalanceSide imbalance_side  = 7;
+
+  string        feed_id         = 8;
+  uint32        seq             = 9;
+}
+
+// ── Instrument Status ───────────────────────────────────────────────────────
+
+enum TradingStatus {
+  STATUS_UNKNOWN   = 0;
+  STATUS_PRE_OPEN  = 1;
+  STATUS_OPEN      = 2;
+  STATUS_HALTED    = 3;
+  STATUS_RESUMED   = 4;
+  STATUS_CLOSED    = 5;
+  STATUS_EXTENDED  = 6;
+}
+
+message InstrumentStatus {
+  string        symbol      = 1;
+  uint64        exchange_ts = 2;
+  uint64        recv_ts     = 3;
+
+  TradingStatus status      = 4;
+  string        reason      = 5;   // halt reason code e.g. "T1" (news pending)
+  string        feed_id     = 6;
+  uint32        seq         = 7;
+}
+
+// ── Heartbeat ───────────────────────────────────────────────────────────────
+
+message Heartbeat {
+  string   feed_id     = 1;
+  uint64   sender_ts   = 2;
+  uint32   seq         = 3;
+}
+
+// ── Envelope — single wrapper sent on the wire ─────────────────────────────
+// Layout: [1-byte MsgType][4-byte big-endian length][protobuf bytes]
+// The C dispatcher in dpdk_pcap reads the first byte to branch before
+// deserialising the full protobuf payload.
+
+message MarketDataEnvelope {
+  MsgType  msg_type = 1;
+  uint32   seq      = 2;
+  uint64   send_ts  = 3;   // sender wall-clock ns
+
+  oneof payload {
+    NBBOUpdate         nbbo      = 10;
+    TradePrint         trade     = 11;
+    OrderBookSnapshot  book      = 12;
+    OrderBookDelta     delta     = 13;
+    AuctionImbalance   imbalance = 14;
+    InstrumentStatus   status    = 15;
+    Heartbeat          heartbeat = 16;
+  }
+}
