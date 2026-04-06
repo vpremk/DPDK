@@ -2,17 +2,21 @@
 send_fix_orders.py — send FIX-over-UDP orders to en0 for dpdk_pcap to capture.
 
 On macOS, traffic from localhost to 127.x goes via lo0, not en0.
-To reach en0 (192.168.1.165) from the same machine we bind the socket
-to en0's IP as source so the kernel routes it out en0.
+To reach en0 from the same machine we bind the socket to en0's IP as source
+so the kernel routes it out en0.
+
+EMS destination is read from the environment (set in ../.env):
+    EMS_HOST   — Mac B IP          (default: MAC_B_IP from .env)
+    EMS_PORT   — FIX UDP port      (default: 4567)
 
 Usage:
     # In terminal 1 (capture):
-    sudo ./dpdk_pcap en0
+    sudo ./ems/dpdk_pcap en0
 
     # In terminal 2 (send):
-    python send_fix_orders.py                        # 10 orders, default rate
-    python send_fix_orders.py --count 100 --rate 50  # 100 orders at 50/sec
-    python send_fix_orders.py --dst 192.168.1.165    # explicit destination
+    python client/send_fix_orders.py                        # 10 orders, default rate
+    python client/send_fix_orders.py --count 100 --rate 50  # 100 orders at 50/sec
+    python client/send_fix_orders.py --dst $EMS_HOST        # override destination
 """
 
 import socket
@@ -21,8 +25,7 @@ import argparse
 import random
 import struct
 
-# ── FIX port that dpdk_pcap BPF-filter listens on ─────────────────────────────
-FIX_PORT    = 4567
+from env import EMS_HOST, FIX_PORT as _FIX_PORT
 
 def _local_en0_ip() -> str:
     """Auto-detect this machine's en0 IP at runtime."""
@@ -36,7 +39,8 @@ def _local_en0_ip() -> str:
         pass
     return ""   # fallback: let OS pick source
 
-EN0_IP = _local_en0_ip()
+EN0_IP   = _local_en0_ip()
+FIX_PORT = _FIX_PORT
 
 # ── FIX message templates (SOH = \x01) ────────────────────────────────────────
 SOH = "\x01"
@@ -148,8 +152,8 @@ def send_orders(dst: str, port: int, count: int, rate: float, verbose: bool):
 
 def main():
     ap = argparse.ArgumentParser(description="Send FIX-over-UDP orders to en0")
-    ap.add_argument("--dst",     default=EN0_IP,  help="destination IP (default: en0 IP)")
-    ap.add_argument("--port",    type=int, default=FIX_PORT, help="UDP port (default: 4567)")
+    ap.add_argument("--dst",  default=EMS_HOST, help="EMS IP  (env: EMS_HOST, default: MAC_B_IP)")
+    ap.add_argument("--port", type=int, default=FIX_PORT, help="UDP port (env: FIX_PORT, default: 4567)")
     ap.add_argument("--count",   type=int, default=10,   help="number of orders")
     ap.add_argument("--rate",    type=float, default=5,  help="orders per second (0=max)")
     ap.add_argument("--verbose", action="store_true",    help="print each message")

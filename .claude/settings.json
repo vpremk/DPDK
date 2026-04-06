@@ -20,7 +20,14 @@
       "Bash(ipconfig getifaddr:*)",
       "Bash(ls /Users/vamsi/aws/low_latency/*.c /Users/vamsi/aws/low_latency/*.sh)",
       "Bash(clang -O2 -Wall dpdk_pcap.c -lpcap -o dpdk_pcap)",
-      "Bash(.venv/bin/python send_market_data.py --count 5 --rate 0 --verbose)"
+      "Bash(.venv/bin/python send_market_data.py --count 5 --rate 0 --verbose)",
+      "Bash(ls /Users/vamsi/aws/low_latency/.env*)",
+      "Bash(.venv/bin/python -c ':*)",
+      "Bash(sed -i '' 's/192\\\\.168\\\\.1\\\\.100/\\\\$MAC_A_IP/g' /Users/vamsi/aws/low_latency/README.md)",
+      "Bash(sed -i '' 's/192\\\\.168\\\\.1\\\\.165/\\\\$MAC_B_IP/g' /Users/vamsi/aws/low_latency/README.md)"
+    ],
+    "additionalDirectories": [
+      "/Users/vamsi/aws/low_latency"
     ]
   }
 }

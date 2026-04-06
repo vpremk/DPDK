@@ -12,7 +12,7 @@
 CC      := clang
 CFLAGS  := -O2 -Wall -Wextra -std=c11
 LDFLAGS := -lpcap
-TARGET  := dpdk_pcap
+TARGET  := ems/dpdk_pcap
 PCAP_SDK:= $(shell xcrun --show-sdk-path)
 IFLAGS  := -I$(PCAP_SDK)/usr/include
 
@@ -20,7 +20,7 @@ PYTHON  := .venv/bin/python3
 IFACE   := en0          # change to your active interface (ifconfig to check)
 PCAP_FILE :=            # set to replay a .pcap file offline
 
-.PHONY: all sim build run offline mc send send-burst clean venv
+.PHONY: all sim build run offline mc send send-mktdata send-burst clean venv
 
 all: build sim mc
 
@@ -31,22 +31,22 @@ venv:
 	.venv/bin/pip install numpy scipy --quiet
 	@echo "✓ venv ready"
 
-## ── Python DPDK simulation ────────────────────────────────────────────
+## ── Python DPDK simulation (EMS) ─────────────────────────────────────
 sim: venv
-	@echo "\n→ Running DPDK Python simulation..."
-	$(PYTHON) dpdk_sim.py
+	@echo "\n→ Running DPDK Python simulation (EMS)..."
+	$(PYTHON) ems/dpdk_sim.py
 
-## ── Monte Carlo pricing ───────────────────────────────────────────────
+## ── Monte Carlo pricing (Pre-Trade Risk) ──────────────────────────────
 mc: venv
-	@echo "\n→ Running Monte Carlo pricing engine..."
-	$(PYTHON) montecarlo_pricing.py
+	@echo "\n→ Running Monte Carlo pricing engine (pre_trade_risk)..."
+	$(PYTHON) pre_trade_risk/montecarlo_pricing.py
 
-## ── C build ───────────────────────────────────────────────────────────
+## ── C build (EMS) ────────────────────────────────────────────────────
 build: $(TARGET)
 
-$(TARGET): dpdk_pcap.c
-	@echo "→ Compiling dpdk_pcap.c..."
-	$(CC) $(CFLAGS) $(IFLAGS) dpdk_pcap.c $(LDFLAGS) -o $(TARGET)
+$(TARGET): ems/dpdk_pcap.c
+	@echo "→ Compiling ems/dpdk_pcap.c..."
+	$(CC) $(CFLAGS) $(IFLAGS) ems/dpdk_pcap.c $(LDFLAGS) -o $(TARGET)
 	@echo "✓ Built: ./$(TARGET)"
 
 ## ── Live capture (needs sudo) ─────────────────────────────────────────
@@ -63,12 +63,20 @@ offline: build
 	fi
 	./$(TARGET) --offline $(PCAP_FILE)
 
-## ── Send FIX orders to en0 ────────────────────────────────────────────
+## ── Send FIX orders (Client) ──────────────────────────────────────────
 send:
-	$(PYTHON) send_fix_orders.py --count 20 --rate 5 --verbose
+	$(PYTHON) client/send_fix_orders.py --count 20 --rate 5 --verbose
 
 send-burst:
-	$(PYTHON) send_fix_orders.py --count 1000 --rate 0
+	$(PYTHON) client/send_fix_orders.py --count 1000 --rate 0
+
+## ── Send market data (Client) ─────────────────────────────────────────
+send-mktdata:
+	$(PYTHON) client/send_market_data.py --count 50 --rate 10 --verbose
+
+## ── RDMA latency benchmark (EMS) ─────────────────────────────────────
+rdma-bench:
+	$(PYTHON) ems/rdma_transport.py --mode bench --iters 50000
 
 ## ── Cleanup ───────────────────────────────────────────────────────────
 clean:
@@ -79,13 +87,15 @@ clean:
 ## ── Help ──────────────────────────────────────────────────────────────
 help:
 	@echo ""
-	@echo "  make sim              — Python DPDK simulation"
-	@echo "  make build            — compile C pcap binary"
-	@echo "  make run IFACE=en0    — live capture (sudo required)"
-	@echo "  make offline PCAP_FILE=x.pcap  — replay pcap file"
-	@echo "  make mc               — Monte Carlo pricing"
-	@echo "  make all              — build + sim + mc"
-	@echo "  make send             — send 20 FIX orders to en0 at 5/s"
-	@echo "  make send-burst       — send 1000 FIX orders at max rate"
-	@echo "  make clean            — remove artifacts"
+	@echo "  make sim                        — EMS: Python DPDK simulation"
+	@echo "  make build                      — EMS: compile C pcap binary"
+	@echo "  make run IFACE=en0              — EMS: live capture (sudo required)"
+	@echo "  make offline PCAP_FILE=x.pcap   — EMS: replay pcap file"
+	@echo "  make mc                         — Pre-Trade Risk: Monte Carlo pricing"
+	@echo "  make send                       — Client: send 20 FIX orders at 5/s"
+	@echo "  make send-burst                 — Client: send 1000 FIX orders at max rate"
+	@echo "  make send-mktdata               — Client: send 50 market-data msgs at 10/s"
+	@echo "  make rdma-bench                 — EMS: RDMA latency benchmark"
+	@echo "  make all                        — build + sim + mc"
+	@echo "  make clean                      — remove artifacts"
 	@echo ""

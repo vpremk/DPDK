@@ -1,21 +1,267 @@
-# Low-Latency FIX Order Pipeline — Mac-to-Mac with DPDK-style Capture
+# Low-Latency FIX Order Pipeline — DPDK & RDMA Concepts on macOS
 
-Two-machine pipeline: **Mac A** sends FIX 4.2 orders over UDP on `en0`.
-**Mac B** captures every packet in kernel-bypass (DPDK-style) mode, parses
-FIX, runs pre-trade risk, and writes an immutable audit log — all before the
-kernel's TCP/IP stack is even involved.
+## Purpose and Scope
+
+This repository is a **learning and concept-demonstration environment** for
+two of the core technologies used in ultra-low-latency trading infrastructure:
+
+- **DPDK (Data Plane Development Kit)** — kernel-bypass packet processing;
+  poll-mode drivers, mbuf pools, lock-free rings, burst I/O
+- **RDMA (Remote Direct Memory Access)** — zero-copy, CPU-bypass memory
+  transfer between machines over InfiniBand or RoCE/EFA
+
+All code here runs on two macOS laptops connected over a standard LAN.
+It faithfully implements the *architecture and data structures* of production
+systems — mbuf pool, SPSC ring, BPF filter, FIX parser, pre-trade risk,
+protobuf market-data feed, RDMA shared-memory simulation — so you can
+understand and test the full pipeline before deploying to real hardware.
+
+> **This is not production kernel bypass.**
+> On macOS, packets still flow through the kernel (libpcap/BPF on the receive
+> side, BSD UDP socket on the send side). The code teaches the patterns;
+> real bypass needs the hardware and OS described below.
+
+---
+
+## What Real Kernel Bypass Requires
+
+True kernel bypass — where userspace code talks directly to the NIC with
+**zero syscalls and zero kernel copies** — requires three things to align:
+
+### 1. The Right OS — Linux only
+
+DPDK's Poll Mode Drivers (PMDs) and RDMA verbs both require Linux.
+macOS has no VFIO, no UIO, and no `/dev/infiniband`. BSD sockets are the
+floor; there is no lower level accessible to userspace on macOS.
+
+### 2. The Right NIC
+
+| NIC / Fabric | Driver | Kernel bypass mechanism |
+|---|---|---|
+| Mellanox/NVIDIA ConnectX-5/6 (InfiniBand or RoCE) | `mlx5` PMD | DPDK VFIO — PMD polls NIC TX/RX descriptor rings |
+| AWS EFA (Elastic Fabric Adapter) | `librte_net_efa` PMD | EFA PMD on EC2; also exposes RDMA verbs via `libfabric` |
+| Solarflare XtremeScale | `ef10` PMD / OpenOnload | Kernel-bypass UDP via `ef_vi` API |
+| Intel E810 / X710 | `ice` / `i40e` PMD | DPDK VFIO |
+| Chelsio T6 | `cxgbe` PMD | DPDK VFIO + iWARP RDMA |
+
+### 3. The Right Software Stack
+
+```
+Production kernel-bypass stack
+───────────────────────────────────────────────────────────────────
+ Application (FIX engine / market data handler)
+      │
+ DPDK rte_eth_rx_burst / rte_eth_tx_burst      ← zero syscall
+      │
+ Poll Mode Driver (PMD)                         ← polls NIC registers
+      │
+ NIC hardware (DMA into hugepage-backed mbufs)  ← zero kernel copy
+      │
+ Wire (IB / RoCE / 10/25/100 GbE)
+───────────────────────────────────────────────────────────────────
+ RDMA one-sided write (rdma_transport.py → libibverbs)
+      │
+ HCA (Host Channel Adapter) hardware            ← remote CPU never wakes
+      │
+ Wire
+```
+
+Key requirements:
+- **Hugepages** — DPDK mbufs must live in 2 MB / 1 GB hugepages (`/dev/hugepages`)
+- **VFIO or UIO** — detaches the NIC from the kernel driver so the PMD owns it
+- **CPU isolation** — dedicated cores for RX/TX loops (`isolcpus`, `DPDK_lcores`)
+- **NUMA awareness** — mbufs allocated on the same NUMA node as the NIC
+
+### Mapping this Repo to Production
+
+| This repo (macOS) | Production equivalent |
+|---|---|
+| `libpcap` + BPF capture | `rte_eth_rx_burst()` polling NIC RX ring |
+| `socket.sendto()` (Python) | `rte_eth_tx_burst()` or `ef_vi_transmit()` |
+| Anonymous `mmap` buffer | Hugepage-backed `rte_mempool` |
+| Shared-memory RDMA sim | `libibverbs` RC QP RDMA_WRITE over EFA/IB |
+| `PCAP_TIMEOUT_MS=0` busy-poll | DPDK `rte_eth_rx_burst` tight loop, no IRQ |
+| SPSC ring (atomic head/tail) | `rte_ring` (same algorithm, same cache-line trick) |
+
+The gap is the hardware abstraction layer. Every concept, data structure, and
+pipeline stage in this repo maps directly to its production counterpart.
+
+---
+
+## This Repo — Two Macs, LAN
+
+Two-machine pipeline: **Mac A** sends FIX 4.2 orders and protobuf market-data
+over UDP on `en0`. **Mac B** captures every packet using a DPDK-style
+architecture (mbuf pool, SPSC ring, busy-poll) backed by libpcap/BPF,
+parses FIX and market-data, runs pre-trade risk, and writes an immutable
+audit log.
 
 ---
 
 ## Network Topology
 
 ```
-┌─────────────────────────┐          1 Gbps Ethernet          ┌────────────────────────────────┐
-│       Mac A             │  ──────────────────────────────►  │          Mac B                 │
-│  (Order Sender)         │    FIX/UDP  port 4567             │  (DPDK Capture + Risk Engine)  │
-│  192.168.1.100          │    ~50–200 µs LAN RTT              │  192.168.1.165                 │
-│  send_fix_orders.py     │                                    │  dpdk_pcap  (C / libpcap)      │
-└─────────────────────────┘                                    └────────────────────────────────┘
+┌─────────────────────────────┐       1 Gbps Ethernet        ┌──────────────────────────────────────┐
+│          Mac A              │  ──────────────────────────► │             Mac B                    │
+│  (Order + MktData Sender)   │  FIX/UDP   port 4567         │  (DPDK-style Capture · libpcap/BPF)  │
+│  $MAC_A_IP              │  Proto/UDP port 5678         │  $MAC_B_IP                       │
+│  send_fix_orders.py         │  ~50–200 µs LAN RTT          │  dpdk_pcap  (C · libpcap)            │
+│  send_market_data.py        │                              │  dpdk_sim.py (Python simulation)     │
+└─────────────────────────────┘                              └──────────────────────────────────────┘
+```
+
+### Kernel Bypass — Reality vs Production
+
+| Transport | Platform | Kernel involved? | Typical latency |
+|---|---|---|---|
+| **libpcap/BPF** (this repo, macOS) | macOS | Yes — BPF copy through kernel | 10–100 µs |
+| **AF_PACKET** (`SOCK_RAW`) | Linux | Yes — kernel copies to userspace | 5–50 µs |
+| **AF_XDP + XDP_ZEROCOPY** | Linux ≥ 5.4 | Near-bypass — DMA into userspace ring | 1–10 µs |
+| **DPDK + VFIO/UIO PMD** | Linux | No — PMD polls NIC registers directly | < 2 µs |
+| **AWS EFA + DPDK** (`librte_net_efa`) | EC2 c5n/p4d/hpc6a | No — EFA PMD, kernel bypass | < 2 µs |
+| **RDMA one-sided write** (`rdma_transport.py`) | Linux + EFA/IB | No — remote CPU never involved | < 1 µs |
+
+On macOS the BPF subsystem still delivers sub-millisecond capture latency for
+development and testing, which is sufficient for validating the pipeline logic.
+Deploy to a Linux EC2 instance with EFA for production kernel-bypass numbers.
+
+---
+
+## How to Run — Step by Step
+
+### Prerequisites (both Macs)
+
+```bash
+# Clone / copy this repo to both machines
+git clone <repo> ~/aws/low_latency && cd ~/aws/low_latency
+
+# Python venv
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# Optional: compile proto stubs for full protobuf encoding
+pip install grpcio-tools
+python -m grpc_tools.protoc -I. --python_out=client/ client/market_data.proto
+```
+
+---
+
+### Mac B — Start First (Receiver + DPDK Capture)
+
+Mac B must be listening before Mac A sends anything.
+
+**Terminal 1 — Build and start the DPDK-style packet capture**
+
+```bash
+# Build (one-time)
+make build   # or: clang -O2 -Wall ems/dpdk_pcap.c -lpcap -o ems/dpdk_pcap
+
+# Live capture on en0 — intercepts both FIX (port 4567) and market data (port 5678)
+sudo ./ems/dpdk_pcap en0
+```
+
+Expected output:
+```
+═══════════════════════════════════════════════
+  DPDK-Style Packet Processor — libpcap/macOS
+═══════════════════════════════════════════════
+[mempool] allocated 4096 mbufs
+[ring]    1024-slot SPSC ring ready
+[pcap]    filter: udp port 4567 or udp port 5678
+Waiting for packets on en0 …
+```
+
+**Terminal 2 — Optional: Python DPDK simulation (no sudo, software only)**
+
+```bash
+# Runs the full pipeline in Python: PMD → Ring → Parser → Risk → Stats
+source .venv/bin/activate
+python ems/dpdk_sim.py
+```
+
+**Terminal 3 — Optional: market-data decoder (verify proto decoding)**
+
+```bash
+source .venv/bin/activate
+python client/send_market_data.py --mode decode --port 5678
+```
+
+---
+
+### Mac A — Send FIX Orders and Market Data
+
+Set `MAC_B_IP` in `.env` to Mac B's `en0` IP (`ipconfig getifaddr en0` on Mac B), then `source .env`.
+All scripts read `EMS_HOST` from the environment — no hardcoded IPs needed.
+
+**Terminal 1 — Send FIX 4.2 orders (NewOrderSingle + CancelRequest)**
+
+```bash
+source .venv/bin/activate
+
+# 10 orders at 5/sec — default
+python client/send_fix_orders.py --dst $EMS_HOST
+
+# 500 orders at 50/sec with per-message print
+python client/send_fix_orders.py --dst $EMS_HOST --count 500 --rate 50 --verbose
+
+# Max rate (stress test)
+python client/send_fix_orders.py --dst $EMS_HOST --count 10000 --rate 0
+```
+
+**Terminal 2 — Send market data feed (NBBO / Trade / L2 Book)**
+
+```bash
+source .venv/bin/activate
+
+# Mixed feed: NBBO + Trade + Heartbeat at 10 msg/s
+python client/send_market_data.py --dst $EMS_HOST
+
+# NBBO only at 1000 msg/s
+python client/send_market_data.py --dst $EMS_HOST --type nbbo --rate 1000 --count 5000
+
+# L2 book snapshots, 10 levels deep
+python client/send_market_data.py --dst $EMS_HOST --type book --depth 10 --count 200
+
+# Incremental book deltas
+python client/send_market_data.py --dst $EMS_HOST --type delta --count 1000 --rate 500
+```
+
+**Terminal 3 — RDMA latency benchmark (same machine, shared-mem simulation)**
+
+```bash
+source .venv/bin/activate
+python ems/rdma_transport.py --mode bench --iters 50000
+```
+
+---
+
+### Audit Log (Mac B)
+
+`dpdk_pcap` appends every FIX decision to `audit_log.jsonl` in the working directory.
+
+```bash
+# Live tail on Mac B
+tail -f post_trade/surveillance/fix_audit.log | python -m json.tool
+
+# Count accepted vs rejected
+grep -c '"decision": "ACCEPTED"' post_trade/surveillance/fix_audit.log
+grep -c '"decision": "REJECTED"' post_trade/surveillance/fix_audit.log
+```
+
+---
+
+### Typical Terminal Layout
+
+```
+Mac A                               Mac B
+──────────────────────              ──────────────────────────────────────
+Terminal 1:                         Terminal 1:
+  python client/send_fix_orders.py    ──►    sudo ./ems/dpdk_pcap en0
+                                        [FIX audit lines in green]
+                                        [MKTDATA lines in cyan]
+
+Terminal 2:                         Terminal 2:
+  python client/send_market_data.py   ──►    tail -f post_trade/surveillance/fix_audit.log
 ```
 
 ---
@@ -44,7 +290,7 @@ sequenceDiagram
     end
 
     APP->>APP: Build FIX 4.2 NewOrderSingle<br/>8=FIX.4.2|35=D|55=AAPL|38=500|44=189.50
-    APP->>SOCK: sendto(dst=192.168.1.165, port=4567)
+    APP->>SOCK: sendto(dst=$MAC_B_IP, port=4567)
     note over APP,SOCK: Source bound to en0 IP<br/>avoids lo0 loopback
 
     SOCK->>WIRE: UDP datagram<br/>Ethernet frame on wire
@@ -190,16 +436,61 @@ The file is opened with `O_APPEND` — each `write()` call is atomic up to `PIPE
 
 ---
 
+## Folder Structure
+
+```
+low_latency/
+├── client/                          Mac A — order and market data senders
+│   ├── send_fix_orders.py           FIX 4.2 NewOrderSingle / CancelRequest over UDP
+│   ├── send_market_data.py          Protobuf NBBO / Trade / L2 Book feed over UDP
+│   ├── market_data.proto            Protobuf schema for all market-data message types
+│   └── market_data_pb2.py           Generated Python stubs (grpc_tools.protoc)
+│
+├── oms/                             Order Management System  [to implement]
+│   └── README.md
+│
+├── pre_trade_risk/                  Pre-Trade Risk Engine
+│   ├── montecarlo_pricing.py        MC VaR, Greeks, Heston, Almgren-Chriss
+│   ├── pre-trade-swimlane.md        Mermaid swimlanes: OMS → Pricing → Risk → Audit
+│   └── pre-trade-deep-dive.md       Every risk check explained
+│
+├── sor/                             Smart Order Router  [to implement]
+│   └── README.md
+│
+├── ems/                             Execution Management System — Mac B
+│   ├── dpdk_pcap.c                  libpcap capture: mbuf pool, SPSC ring, BPF
+│   ├── dpdk_sim.py                  Pure-Python DPDK simulation (no sudo)
+│   ├── rdma_transport.py            RDMA zero-copy transfer (EFA/IB or shared-mem sim)
+│   ├── dpdk_sequence.drawio         DPDK pipeline sequence diagram
+│   └── test.pcap                    Sample capture for offline replay
+│
+└── post_trade/
+    ├── clearance/                   CCP novation, margin, netting  [to implement]
+    │   └── README.md
+    ├── settlement/                  DvP, T+1, reconciliation  [to implement]
+    │   └── README.md
+    └── surveillance/                Audit trail, market abuse detection
+        ├── README.md
+        └── fix_audit.log            Live NDJSON audit log written by ems/dpdk_pcap
+```
+
 ## File Map
 
-| File | Machine | Role |
+| File | Lifecycle Stage | Role |
 |---|---|---|
-| [send_fix_orders.py](send_fix_orders.py) | Mac A | Builds & sends FIX 4.2 NewOrderSingle / CancelRequest over UDP |
-| [dpdk_pcap.c](dpdk_pcap.c) | Mac B | Kernel-bypass capture loop: mbuf pool, SPSC ring, BPF, FIX detection |
-| [dpdk_sim.py](dpdk_sim.py) | Mac B | Pure-Python DPDK simulation (mempool, ring, PMD, pipeline) |
-| [montecarlo_pricing.py](montecarlo_pricing.py) | Mac B | Pre-trade risk: MC VaR, Greeks, Heston, Almgren-Chriss |
-| [rdma_transport.py](rdma_transport.py) | Both | RDMA zero-copy buffer transfer (EFA/IB or shared-mem sim) |
-| [pre-trade-swimlane.md](pre-trade-swimlane.md) | — | Mermaid swimlane diagrams: OMS → Pricing → Risk → Audit |
+| [client/send_fix_orders.py](client/send_fix_orders.py) | Client | FIX 4.2 NewOrderSingle / CancelRequest over UDP |
+| [client/send_market_data.py](client/send_market_data.py) | Client | Protobuf NBBO / Trade / L2 Book feed over UDP |
+| [client/market_data.proto](client/market_data.proto) | Client | Protobuf schema: 7 market-data message types |
+| [oms/README.md](oms/README.md) | OMS | State machine, FIX session, persistence spec |
+| [pre_trade_risk/montecarlo_pricing.py](pre_trade_risk/montecarlo_pricing.py) | Pre-Trade Risk | MC VaR, Greeks, Heston, Almgren-Chriss |
+| [pre_trade_risk/pre-trade-swimlane.md](pre_trade_risk/pre-trade-swimlane.md) | Pre-Trade Risk | Mermaid swimlane diagrams |
+| [sor/README.md](sor/README.md) | SOR | Venue ranking, algo selection spec |
+| [ems/dpdk_pcap.c](ems/dpdk_pcap.c) | EMS | libpcap capture: mbuf pool, SPSC ring, FIX + proto parser |
+| [ems/dpdk_sim.py](ems/dpdk_sim.py) | EMS | Pure-Python DPDK simulation |
+| [ems/rdma_transport.py](ems/rdma_transport.py) | EMS | RDMA zero-copy transfer (EFA/IB or shared-mem sim) |
+| [post_trade/surveillance/fix_audit.log](post_trade/surveillance/fix_audit.log) | Surveillance | Immutable NDJSON audit log |
+| [post_trade/clearance/README.md](post_trade/clearance/README.md) | Clearance | CCP novation, margin, netting spec |
+| [post_trade/settlement/README.md](post_trade/settlement/README.md) | Settlement | DvP, T+1, reconciliation spec |
 
 ---
 
@@ -209,23 +500,23 @@ The file is opened with `O_APPEND` — each `write()` call is atomic up to `PIPE
 
 ```bash
 # Auto-detects en0 IP; sends 50 orders at 10/sec
-python send_fix_orders.py --count 50 --rate 10 --verbose
+python client/send_fix_orders.py --count 50 --rate 10 --verbose
 
 # Send to explicit IP at max rate
-python send_fix_orders.py --dst 192.168.1.165 --count 1000 --rate 0
+python client/send_fix_orders.py --dst $EMS_HOST --count 1000 --rate 0
 ```
 
 ### Mac B — Capture & Process
 
 ```bash
 # 1. Build the DPDK-style capture binary
-clang -O2 -Wall dpdk_pcap.c -lpcap -o dpdk_pcap
+make build   # or: clang -O2 -Wall ems/dpdk_pcap.c -lpcap -o ems/dpdk_pcap
 
 # 2. Run live capture on en0 (needs sudo for libpcap)
-sudo ./dpdk_pcap en0
+sudo ./ems/dpdk_pcap en0
 
 # 3. Or replay a saved pcap offline (no sudo needed)
-./dpdk_pcap --offline test.pcap
+./ems/dpdk_pcap --offline ems/test.pcap
 ```
 
 ### Mac B — Python DPDK Simulation (no sudo)
@@ -234,13 +525,13 @@ sudo ./dpdk_pcap en0
 pip install -r requirements.txt
 
 # Runs the full pipeline simulation: PMD → Ring → Parser → Risk → Stats
-python dpdk_sim.py
+python ems/dpdk_sim.py
 ```
 
 ### Latency Benchmark (RDMA simulation)
 
 ```bash
-python rdma_transport.py --mode bench --iters 50000
+python ems/rdma_transport.py --mode bench --iters 50000
 ```
 
 ---
