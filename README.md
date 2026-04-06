@@ -1,22 +1,129 @@
-# Low-Latency FIX Order Pipeline — Mac-to-Mac with DPDK-style Capture
+# Low-Latency FIX Order Pipeline — DPDK & RDMA Concepts on macOS
 
-Two-machine pipeline: **Mac A** sends FIX 4.2 orders over UDP on `en0`.
-**Mac B** captures every packet in kernel-bypass (DPDK-style) mode, parses
-FIX, runs pre-trade risk, and writes an immutable audit log — all before the
-kernel's TCP/IP stack is even involved.
+## Purpose and Scope
+
+This repository is a **learning and concept-demonstration environment** for
+two of the core technologies used in ultra-low-latency trading infrastructure:
+
+- **DPDK (Data Plane Development Kit)** — kernel-bypass packet processing;
+  poll-mode drivers, mbuf pools, lock-free rings, burst I/O
+- **RDMA (Remote Direct Memory Access)** — zero-copy, CPU-bypass memory
+  transfer between machines over InfiniBand or RoCE/EFA
+
+All code here runs on two macOS laptops connected over a standard LAN.
+It faithfully implements the *architecture and data structures* of production
+systems — mbuf pool, SPSC ring, BPF filter, FIX parser, pre-trade risk,
+protobuf market-data feed, RDMA shared-memory simulation — so you can
+understand and test the full pipeline before deploying to real hardware.
+
+> **This is not production kernel bypass.**
+> On macOS, packets still flow through the kernel (libpcap/BPF on the receive
+> side, BSD UDP socket on the send side). The code teaches the patterns;
+> real bypass needs the hardware and OS described below.
+
+---
+
+## What Real Kernel Bypass Requires
+
+True kernel bypass — where userspace code talks directly to the NIC with
+**zero syscalls and zero kernel copies** — requires three things to align:
+
+### 1. The Right OS — Linux only
+
+DPDK's Poll Mode Drivers (PMDs) and RDMA verbs both require Linux.
+macOS has no VFIO, no UIO, and no `/dev/infiniband`. BSD sockets are the
+floor; there is no lower level accessible to userspace on macOS.
+
+### 2. The Right NIC
+
+| NIC / Fabric | Driver | Kernel bypass mechanism |
+|---|---|---|
+| Mellanox/NVIDIA ConnectX-5/6 (InfiniBand or RoCE) | `mlx5` PMD | DPDK VFIO — PMD polls NIC TX/RX descriptor rings |
+| AWS EFA (Elastic Fabric Adapter) | `librte_net_efa` PMD | EFA PMD on EC2; also exposes RDMA verbs via `libfabric` |
+| Solarflare XtremeScale | `ef10` PMD / OpenOnload | Kernel-bypass UDP via `ef_vi` API |
+| Intel E810 / X710 | `ice` / `i40e` PMD | DPDK VFIO |
+| Chelsio T6 | `cxgbe` PMD | DPDK VFIO + iWARP RDMA |
+
+### 3. The Right Software Stack
+
+```
+Production kernel-bypass stack
+───────────────────────────────────────────────────────────────────
+ Application (FIX engine / market data handler)
+      │
+ DPDK rte_eth_rx_burst / rte_eth_tx_burst      ← zero syscall
+      │
+ Poll Mode Driver (PMD)                         ← polls NIC registers
+      │
+ NIC hardware (DMA into hugepage-backed mbufs)  ← zero kernel copy
+      │
+ Wire (IB / RoCE / 10/25/100 GbE)
+───────────────────────────────────────────────────────────────────
+ RDMA one-sided write (rdma_transport.py → libibverbs)
+      │
+ HCA (Host Channel Adapter) hardware            ← remote CPU never wakes
+      │
+ Wire
+```
+
+Key requirements:
+- **Hugepages** — DPDK mbufs must live in 2 MB / 1 GB hugepages (`/dev/hugepages`)
+- **VFIO or UIO** — detaches the NIC from the kernel driver so the PMD owns it
+- **CPU isolation** — dedicated cores for RX/TX loops (`isolcpus`, `DPDK_lcores`)
+- **NUMA awareness** — mbufs allocated on the same NUMA node as the NIC
+
+### Mapping this Repo to Production
+
+| This repo (macOS) | Production equivalent |
+|---|---|
+| `libpcap` + BPF capture | `rte_eth_rx_burst()` polling NIC RX ring |
+| `socket.sendto()` (Python) | `rte_eth_tx_burst()` or `ef_vi_transmit()` |
+| Anonymous `mmap` buffer | Hugepage-backed `rte_mempool` |
+| Shared-memory RDMA sim | `libibverbs` RC QP RDMA_WRITE over EFA/IB |
+| `PCAP_TIMEOUT_MS=0` busy-poll | DPDK `rte_eth_rx_burst` tight loop, no IRQ |
+| SPSC ring (atomic head/tail) | `rte_ring` (same algorithm, same cache-line trick) |
+
+The gap is the hardware abstraction layer. Every concept, data structure, and
+pipeline stage in this repo maps directly to its production counterpart.
+
+---
+
+## This Repo — Two Macs, LAN
+
+Two-machine pipeline: **Mac A** sends FIX 4.2 orders and protobuf market-data
+over UDP on `en0`. **Mac B** captures every packet using a DPDK-style
+architecture (mbuf pool, SPSC ring, busy-poll) backed by libpcap/BPF,
+parses FIX and market-data, runs pre-trade risk, and writes an immutable
+audit log.
 
 ---
 
 ## Network Topology
 
 ```
-┌─────────────────────────┐          1 Gbps Ethernet          ┌────────────────────────────────┐
-│       Mac A             │  ──────────────────────────────►  │          Mac B                 │
-│  (Order Sender)         │    FIX/UDP  port 4567             │  (DPDK Capture + Risk Engine)  │
-│  192.168.1.100          │    ~50–200 µs LAN RTT              │  192.168.1.165                 │
-│  send_fix_orders.py     │                                    │  dpdk_pcap  (C / libpcap)      │
-└─────────────────────────┘                                    └────────────────────────────────┘
+┌─────────────────────────────┐       1 Gbps Ethernet        ┌──────────────────────────────────────┐
+│          Mac A              │  ──────────────────────────► │             Mac B                    │
+│  (Order + MktData Sender)   │  FIX/UDP   port 4567         │  (DPDK-style Capture · libpcap/BPF)  │
+│  192.168.1.100              │  Proto/UDP port 5678         │  192.168.1.165                       │
+│  send_fix_orders.py         │  ~50–200 µs LAN RTT          │  dpdk_pcap  (C · libpcap)            │
+│  send_market_data.py        │                              │  dpdk_sim.py (Python simulation)     │
+└─────────────────────────────┘                              └──────────────────────────────────────┘
 ```
+
+### Kernel Bypass — Reality vs Production
+
+| Transport | Platform | Kernel involved? | Typical latency |
+|---|---|---|---|
+| **libpcap/BPF** (this repo, macOS) | macOS | Yes — BPF copy through kernel | 10–100 µs |
+| **AF_PACKET** (`SOCK_RAW`) | Linux | Yes — kernel copies to userspace | 5–50 µs |
+| **AF_XDP + XDP_ZEROCOPY** | Linux ≥ 5.4 | Near-bypass — DMA into userspace ring | 1–10 µs |
+| **DPDK + VFIO/UIO PMD** | Linux | No — PMD polls NIC registers directly | < 2 µs |
+| **AWS EFA + DPDK** (`librte_net_efa`) | EC2 c5n/p4d/hpc6a | No — EFA PMD, kernel bypass | < 2 µs |
+| **RDMA one-sided write** (`rdma_transport.py`) | Linux + EFA/IB | No — remote CPU never involved | < 1 µs |
+
+On macOS the BPF subsystem still delivers sub-millisecond capture latency for
+development and testing, which is sufficient for validating the pipeline logic.
+Deploy to a Linux EC2 instance with EFA for production kernel-bypass numbers.
 
 ---
 
