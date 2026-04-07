@@ -141,7 +141,7 @@ pip install -r requirements.txt
 
 # Optional: compile proto stubs for full protobuf encoding
 pip install grpcio-tools
-python -m grpc_tools.protoc -I. --python_out=. market_data.proto
+python -m grpc_tools.protoc -I. --python_out=client/ client/market_data.proto
 ```
 
 ---
@@ -154,10 +154,10 @@ Mac B must be listening before Mac A sends anything.
 
 ```bash
 # Build (one-time)
-clang -O2 -Wall dpdk_pcap.c -lpcap -o dpdk_pcap
+make build   # or: clang -O2 -Wall ems/dpdk_pcap.c -lpcap -o ems/dpdk_pcap
 
 # Live capture on en0 — intercepts both FIX (port 4567) and market data (port 5678)
-sudo ./dpdk_pcap en0
+sudo ./ems/dpdk_pcap en0
 ```
 
 Expected output:
@@ -176,14 +176,14 @@ Waiting for packets on en0 …
 ```bash
 # Runs the full pipeline in Python: PMD → Ring → Parser → Risk → Stats
 source .venv/bin/activate
-python dpdk_sim.py
+python ems/dpdk_sim.py
 ```
 
 **Terminal 3 — Optional: market-data decoder (verify proto decoding)**
 
 ```bash
 source .venv/bin/activate
-python send_market_data.py --mode decode --port 5678
+python client/send_market_data.py --mode decode --port 5678
 ```
 
 ---
@@ -198,13 +198,13 @@ Replace `192.168.1.165` with Mac B's actual `en0` IP (`ipconfig getifaddr en0` o
 source .venv/bin/activate
 
 # 10 orders at 5/sec — default
-python send_fix_orders.py --dst 192.168.1.165
+python client/send_fix_orders.py --dst 192.168.1.165
 
 # 500 orders at 50/sec with per-message print
-python send_fix_orders.py --dst 192.168.1.165 --count 500 --rate 50 --verbose
+python client/send_fix_orders.py --dst 192.168.1.165 --count 500 --rate 50 --verbose
 
 # Max rate (stress test)
-python send_fix_orders.py --dst 192.168.1.165 --count 10000 --rate 0
+python client/send_fix_orders.py --dst 192.168.1.165 --count 10000 --rate 0
 ```
 
 **Terminal 2 — Send market data feed (NBBO / Trade / L2 Book)**
@@ -213,23 +213,23 @@ python send_fix_orders.py --dst 192.168.1.165 --count 10000 --rate 0
 source .venv/bin/activate
 
 # Mixed feed: NBBO + Trade + Heartbeat at 10 msg/s
-python send_market_data.py --dst 192.168.1.165
+python client/send_market_data.py --dst 192.168.1.165
 
 # NBBO only at 1000 msg/s
-python send_market_data.py --dst 192.168.1.165 --type nbbo --rate 1000 --count 5000
+python client/send_market_data.py --dst 192.168.1.165 --type nbbo --rate 1000 --count 5000
 
 # L2 book snapshots, 10 levels deep
-python send_market_data.py --dst 192.168.1.165 --type book --depth 10 --count 200
+python client/send_market_data.py --dst 192.168.1.165 --type book --depth 10 --count 200
 
 # Incremental book deltas
-python send_market_data.py --dst 192.168.1.165 --type delta --count 1000 --rate 500
+python client/send_market_data.py --dst 192.168.1.165 --type delta --count 1000 --rate 500
 ```
 
 **Terminal 3 — RDMA latency benchmark (same machine, shared-mem simulation)**
 
 ```bash
 source .venv/bin/activate
-python rdma_transport.py --mode bench --iters 50000
+python ems/rdma_transport.py --mode bench --iters 50000
 ```
 
 ---
@@ -240,11 +240,11 @@ python rdma_transport.py --mode bench --iters 50000
 
 ```bash
 # Live tail on Mac B
-tail -f audit_log.jsonl | python -m json.tool
+tail -f post_trade/surveillance/fix_audit.log | python -m json.tool
 
 # Count accepted vs rejected
-grep -c '"decision": "ACCEPTED"' audit_log.jsonl
-grep -c '"decision": "REJECTED"' audit_log.jsonl
+grep -c '"decision": "ACCEPTED"' post_trade/surveillance/fix_audit.log
+grep -c '"decision": "REJECTED"' post_trade/surveillance/fix_audit.log
 ```
 
 ---
@@ -255,12 +255,12 @@ grep -c '"decision": "REJECTED"' audit_log.jsonl
 Mac A                               Mac B
 ──────────────────────              ──────────────────────────────────────
 Terminal 1:                         Terminal 1:
-  python send_fix_orders.py    ──►    sudo ./dpdk_pcap en0
+  python client/send_fix_orders.py    ──►    sudo ./ems/dpdk_pcap en0
                                         [FIX audit lines in green]
                                         [MKTDATA lines in cyan]
 
 Terminal 2:                         Terminal 2:
-  python send_market_data.py   ──►    tail -f audit_log.jsonl
+  python client/send_market_data.py   ──►    tail -f post_trade/surveillance/fix_audit.log
 ```
 
 ---
@@ -435,16 +435,61 @@ The file is opened with `O_APPEND` — each `write()` call is atomic up to `PIPE
 
 ---
 
+## Folder Structure
+
+```
+low_latency/
+├── client/                          Mac A — order and market data senders
+│   ├── send_fix_orders.py           FIX 4.2 NewOrderSingle / CancelRequest over UDP
+│   ├── send_market_data.py          Protobuf NBBO / Trade / L2 Book feed over UDP
+│   ├── market_data.proto            Protobuf schema for all market-data message types
+│   └── market_data_pb2.py           Generated Python stubs (grpc_tools.protoc)
+│
+├── oms/                             Order Management System  [to implement]
+│   └── README.md
+│
+├── pre_trade_risk/                  Pre-Trade Risk Engine
+│   ├── montecarlo_pricing.py        MC VaR, Greeks, Heston, Almgren-Chriss
+│   ├── pre-trade-swimlane.md        Mermaid swimlanes: OMS → Pricing → Risk → Audit
+│   └── pre-trade-deep-dive.md       Every risk check explained
+│
+├── sor/                             Smart Order Router  [to implement]
+│   └── README.md
+│
+├── ems/                             Execution Management System — Mac B
+│   ├── dpdk_pcap.c                  libpcap capture: mbuf pool, SPSC ring, BPF
+│   ├── dpdk_sim.py                  Pure-Python DPDK simulation (no sudo)
+│   ├── rdma_transport.py            RDMA zero-copy transfer (EFA/IB or shared-mem sim)
+│   ├── dpdk_sequence.drawio         DPDK pipeline sequence diagram
+│   └── test.pcap                    Sample capture for offline replay
+│
+└── post_trade/
+    ├── clearance/                   CCP novation, margin, netting  [to implement]
+    │   └── README.md
+    ├── settlement/                  DvP, T+1, reconciliation  [to implement]
+    │   └── README.md
+    └── surveillance/                Audit trail, market abuse detection
+        ├── README.md
+        └── fix_audit.log            Live NDJSON audit log written by ems/dpdk_pcap
+```
+
 ## File Map
 
-| File | Machine | Role |
+| File | Lifecycle Stage | Role |
 |---|---|---|
-| [send_fix_orders.py](send_fix_orders.py) | Mac A | Builds & sends FIX 4.2 NewOrderSingle / CancelRequest over UDP |
-| [dpdk_pcap.c](dpdk_pcap.c) | Mac B | Kernel-bypass capture loop: mbuf pool, SPSC ring, BPF, FIX detection |
-| [dpdk_sim.py](dpdk_sim.py) | Mac B | Pure-Python DPDK simulation (mempool, ring, PMD, pipeline) |
-| [montecarlo_pricing.py](montecarlo_pricing.py) | Mac B | Pre-trade risk: MC VaR, Greeks, Heston, Almgren-Chriss |
-| [rdma_transport.py](rdma_transport.py) | Both | RDMA zero-copy buffer transfer (EFA/IB or shared-mem sim) |
-| [pre-trade-swimlane.md](pre-trade-swimlane.md) | — | Mermaid swimlane diagrams: OMS → Pricing → Risk → Audit |
+| [client/send_fix_orders.py](client/send_fix_orders.py) | Client | FIX 4.2 NewOrderSingle / CancelRequest over UDP |
+| [client/send_market_data.py](client/send_market_data.py) | Client | Protobuf NBBO / Trade / L2 Book feed over UDP |
+| [client/market_data.proto](client/market_data.proto) | Client | Protobuf schema: 7 market-data message types |
+| [oms/README.md](oms/README.md) | OMS | State machine, FIX session, persistence spec |
+| [pre_trade_risk/montecarlo_pricing.py](pre_trade_risk/montecarlo_pricing.py) | Pre-Trade Risk | MC VaR, Greeks, Heston, Almgren-Chriss |
+| [pre_trade_risk/pre-trade-swimlane.md](pre_trade_risk/pre-trade-swimlane.md) | Pre-Trade Risk | Mermaid swimlane diagrams |
+| [sor/README.md](sor/README.md) | SOR | Venue ranking, algo selection spec |
+| [ems/dpdk_pcap.c](ems/dpdk_pcap.c) | EMS | libpcap capture: mbuf pool, SPSC ring, FIX + proto parser |
+| [ems/dpdk_sim.py](ems/dpdk_sim.py) | EMS | Pure-Python DPDK simulation |
+| [ems/rdma_transport.py](ems/rdma_transport.py) | EMS | RDMA zero-copy transfer (EFA/IB or shared-mem sim) |
+| [post_trade/surveillance/fix_audit.log](post_trade/surveillance/fix_audit.log) | Surveillance | Immutable NDJSON audit log |
+| [post_trade/clearance/README.md](post_trade/clearance/README.md) | Clearance | CCP novation, margin, netting spec |
+| [post_trade/settlement/README.md](post_trade/settlement/README.md) | Settlement | DvP, T+1, reconciliation spec |
 
 ---
 
@@ -454,23 +499,23 @@ The file is opened with `O_APPEND` — each `write()` call is atomic up to `PIPE
 
 ```bash
 # Auto-detects en0 IP; sends 50 orders at 10/sec
-python send_fix_orders.py --count 50 --rate 10 --verbose
+python client/send_fix_orders.py --count 50 --rate 10 --verbose
 
 # Send to explicit IP at max rate
-python send_fix_orders.py --dst 192.168.1.165 --count 1000 --rate 0
+python client/send_fix_orders.py --dst 192.168.1.165 --count 1000 --rate 0
 ```
 
 ### Mac B — Capture & Process
 
 ```bash
 # 1. Build the DPDK-style capture binary
-clang -O2 -Wall dpdk_pcap.c -lpcap -o dpdk_pcap
+make build   # or: clang -O2 -Wall ems/dpdk_pcap.c -lpcap -o ems/dpdk_pcap
 
 # 2. Run live capture on en0 (needs sudo for libpcap)
-sudo ./dpdk_pcap en0
+sudo ./ems/dpdk_pcap en0
 
 # 3. Or replay a saved pcap offline (no sudo needed)
-./dpdk_pcap --offline test.pcap
+./ems/dpdk_pcap --offline ems/test.pcap
 ```
 
 ### Mac B — Python DPDK Simulation (no sudo)
@@ -479,13 +524,13 @@ sudo ./dpdk_pcap en0
 pip install -r requirements.txt
 
 # Runs the full pipeline simulation: PMD → Ring → Parser → Risk → Stats
-python dpdk_sim.py
+python ems/dpdk_sim.py
 ```
 
 ### Latency Benchmark (RDMA simulation)
 
 ```bash
-python rdma_transport.py --mode bench --iters 50000
+python ems/rdma_transport.py --mode bench --iters 50000
 ```
 
 ---
