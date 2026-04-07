@@ -329,7 +329,7 @@ static volatile sig_atomic_t g_running = 1;
  *  "seq":42,"msg_type":"NewOrderSingle","tag35":"D",
  *  "cl_ord_id":"ORD000042","symbol":"AAPL","side":"Buy","qty":500,
  *  "price":"123.45","src":"192.168.1.200:54321",
- *  "dst":"192.168.1.165:4567","payload_len":180,"lat_ns":412}
+ *  "dst":"192.X.Y.X:4567","payload_len":180,"lat_ns":412}
  * ───────────────────────────────────────────────────────────────────── */
 #define AUDIT_LOG_PATH "fix_audit.log"
 

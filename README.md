@@ -193,7 +193,14 @@ python client/send_market_data.py --mode decode --port 5678
 Set `MAC_B_IP` in `.env` to Mac B's `en0` IP (`ipconfig getifaddr en0` on Mac B), then `source .env`.
 All scripts read `EMS_HOST` from the environment — no hardcoded IPs needed.
 
-**Terminal 1 — Send FIX 4.2 orders (NewOrderSingle + CancelRequest)**
+---
+
+**Terminal 1 — Trader UI (recommended — replaces send_fix_orders.py)**
+
+The interactive terminal UI supports two modes switchable with `Tab`:
+
+- **Manual mode** — fill in Symbol / Side / Qty / Price / OrdType, hit `F9` to send one order
+- **Algo mode** — configure rate, count, symbol universe; `F9` starts the burst, `F10` stops it
 
 ```bash
 source .venv/bin/activate
@@ -208,7 +215,53 @@ python client/send_fix_orders.py --dst $EMS_HOST --count 500 --rate 50 --verbose
 python client/send_fix_orders.py --dst $EMS_HOST --count 10000 --rate 0
 ```
 
-**Terminal 2 — Send market data feed (NBBO / Trade / L2 Book)**
+Key bindings inside the TUI:
+
+| Key | Action |
+|---|---|
+| `Tab` / `t` | Toggle Manual ↔ Algo mode |
+| `F9` | Submit order (Manual) / Start algo (Algo) |
+| `F10` | Stop algo |
+| `Ctrl+C` | Send FIX CancelRequest for highlighted blotter row |
+| `Ctrl+Q` | Quit |
+
+---
+
+**Terminal 2 — GBO Reference Data (load before running risk checks)**
+
+`gbo_ref_data.py` is the firm's golden source for instrument master, counterparty
+limits, account limits, FX rates, and holiday calendars.  Run it standalone to
+seed the in-memory store and validate all pre-trade and post-trade risk checks:
+
+```bash
+source .venv/bin/activate
+
+# Full demo: loads all ref data, runs pre-trade checks on sample orders,
+# books fills, prints position report and post-trade violations
+python gbo_ref_data.py
+```
+
+What the demo prints:
+- Instrument master (ISIN, CUSIP, tick size, lot size, currency)
+- Counterparty / account / limit tables
+- Pre-trade risk results for 5 sample orders (PASS / WARN / BLOCK per check)
+- Post-trade position report with P&L, gross/net exposure, VaR
+- Any post-trade limit breaches with severity
+
+The `GBORefDataStore` class is imported by `pre_trade_risk/montecarlo_pricing.py`
+and the post-trade surveillance engine.  Always start GBO before the risk engines:
+
+```python
+from gbo_ref_data import GBORefDataStore, PreTradeRiskEngine
+
+gbo    = GBORefDataStore()
+engine = PreTradeRiskEngine(gbo)
+result = engine.check(order)
+```
+
+---
+
+**Terminal 3 — Send market data feed (NBBO / Trade / L2 Book)**
 
 ```bash
 source .venv/bin/activate
@@ -226,7 +279,23 @@ python client/send_market_data.py --dst $EMS_HOST --type book --depth 10 --count
 python client/send_market_data.py --dst $EMS_HOST --type delta --count 1000 --rate 500
 ```
 
-**Terminal 3 — RDMA latency benchmark (same machine, shared-mem simulation)**
+---
+
+**Terminal 4 — Script-based FIX sender (headless / CI)**
+
+```bash
+source .venv/bin/activate
+
+# 500 orders at 50/sec
+python client/send_fix_orders.py --dst 192.X.Y.X --count 500 --rate 50 --verbose
+
+# Max rate stress test
+python client/send_fix_orders.py --dst 192.X.Y.X --count 10000 --rate 0
+```
+
+---
+
+**Terminal 5 — RDMA latency benchmark**
 
 ```bash
 source .venv/bin/activate
@@ -237,7 +306,7 @@ python ems/rdma_transport.py --mode bench --iters 50000
 
 ### Audit Log (Mac B)
 
-`dpdk_pcap` appends every FIX decision to `audit_log.jsonl` in the working directory.
+`dpdk_pcap` appends every FIX decision to `post_trade/surveillance/fix_audit.log`.
 
 ```bash
 # Live tail on Mac B
@@ -253,15 +322,18 @@ grep -c '"decision": "REJECTED"' post_trade/surveillance/fix_audit.log
 ### Typical Terminal Layout
 
 ```
-Mac A                               Mac B
-──────────────────────              ──────────────────────────────────────
-Terminal 1:                         Terminal 1:
-  python client/send_fix_orders.py    ──►    sudo ./ems/dpdk_pcap en0
-                                        [FIX audit lines in green]
-                                        [MKTDATA lines in cyan]
+Mac A                                    Mac B
+──────────────────────────────────────   ────────────────────────────────────────
+Terminal 1  (Trader UI — interactive):   Terminal 1  (EMS capture):
+  python client/trader_ui.py        ──►    sudo ./ems/dpdk_pcap en0
+    [Manual or Algo mode toggle]             [FIX lines in green]
+    [live order blotter]                     [MKTDATA lines in cyan]
 
-Terminal 2:                         Terminal 2:
-  python client/send_market_data.py   ──►    tail -f post_trade/surveillance/fix_audit.log
+Terminal 2  (GBO ref data):              Terminal 2  (Audit log tail):
+  python gbo_ref_data.py            ──►    tail -f post_trade/surveillance/fix_audit.log
+
+Terminal 3  (Market data feed):          Terminal 3  (Python DPDK sim, optional):
+  python client/send_market_data.py ──►    python ems/dpdk_sim.py
 ```
 
 ---
@@ -440,8 +512,11 @@ The file is opened with `O_APPEND` — each `write()` call is atomic up to `PIPE
 
 ```
 low_latency/
+├── gbo_ref_data.py                  GBO golden source: instrument/counterparty/limit/FX ref data
+│
 ├── client/                          Mac A — order and market data senders
-│   ├── send_fix_orders.py           FIX 4.2 NewOrderSingle / CancelRequest over UDP
+│   ├── trader_ui.py                 Textual TUI: Manual order entry + Algo burst mode
+│   ├── send_fix_orders.py           FIX 4.2 NewOrderSingle / CancelRequest over UDP (headless)
 │   ├── send_market_data.py          Protobuf NBBO / Trade / L2 Book feed over UDP
 │   ├── market_data.proto            Protobuf schema for all market-data message types
 │   └── market_data_pb2.py           Generated Python stubs (grpc_tools.protoc)
@@ -478,7 +553,9 @@ low_latency/
 
 | File | Lifecycle Stage | Role |
 |---|---|---|
-| [client/send_fix_orders.py](client/send_fix_orders.py) | Client | FIX 4.2 NewOrderSingle / CancelRequest over UDP |
+| [gbo_ref_data.py](gbo_ref_data.py) | Shared | GBO golden source: instrument master, counterparty, limits, FX rates |
+| [client/trader_ui.py](client/trader_ui.py) | Client | Textual TUI — Manual order entry + Algo burst mode, live blotter |
+| [client/send_fix_orders.py](client/send_fix_orders.py) | Client | Headless FIX 4.2 sender — CI / stress testing |
 | [client/send_market_data.py](client/send_market_data.py) | Client | Protobuf NBBO / Trade / L2 Book feed over UDP |
 | [client/market_data.proto](client/market_data.proto) | Client | Protobuf schema: 7 market-data message types |
 | [oms/README.md](oms/README.md) | OMS | State machine, FIX session, persistence spec |
