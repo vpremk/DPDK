@@ -1,2 +1,5 @@
 numpy==2.4.4
 scipy==1.17.1
+textual>=0.60.0
+protobuf>=4.25.0
+grpcio-tools>=1.62.0
