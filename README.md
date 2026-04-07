@@ -135,6 +135,14 @@ Deploy to a Linux EC2 instance with EFA for production kernel-bypass numbers.
 # Clone / copy this repo to both machines
 git clone <repo> ~/aws/low_latency && cd ~/aws/low_latency
 
+# Configure network IPs — copy template, then edit MAC_A_IP and MAC_B_IP
+cp .env.template .env
+nano .env          # set MAC_A_IP=<this machine's en0>  MAC_B_IP=<other machine's en0>
+                   # run: ipconfig getifaddr en0   to find your en0 IP
+
+# Load env vars into the shell (repeat in every new terminal session)
+source .env
+
 # Python venv
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
