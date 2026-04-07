@@ -201,7 +201,14 @@ python client/send_market_data.py --mode decode --port 5678
 Set `MAC_B_IP` in `.env` to Mac B's `en0` IP (`ipconfig getifaddr en0` on Mac B), then `source .env`.
 All scripts read `EMS_HOST` from the environment — no hardcoded IPs needed.
 
-**Terminal 1 — Send FIX 4.2 orders (NewOrderSingle + CancelRequest)**
+---
+
+**Terminal 1 — Trader UI (recommended — replaces send_fix_orders.py)**
+
+The interactive terminal UI supports two modes switchable with `Tab`:
+
+- **Manual mode** — fill in Symbol / Side / Qty / Price / OrdType, hit `F9` to send one order
+- **Algo mode** — configure rate, count, symbol universe; `F9` starts the burst, `F10` stops it
 
 ```bash
 source .venv/bin/activate
@@ -216,7 +223,53 @@ python client/send_fix_orders.py --dst $EMS_HOST --count 500 --rate 50 --verbose
 python client/send_fix_orders.py --dst $EMS_HOST --count 10000 --rate 0
 ```
 
-**Terminal 2 — Send market data feed (NBBO / Trade / L2 Book)**
+Key bindings inside the TUI:
+
+| Key | Action |
+|---|---|
+| `Tab` / `t` | Toggle Manual ↔ Algo mode |
+| `F9` | Submit order (Manual) / Start algo (Algo) |
+| `F10` | Stop algo |
+| `Ctrl+C` | Send FIX CancelRequest for highlighted blotter row |
+| `Ctrl+Q` | Quit |
+
+---
+
+**Terminal 2 — GBO Reference Data (load before running risk checks)**
+
+`gbo_ref_data.py` is the firm's golden source for instrument master, counterparty
+limits, account limits, FX rates, and holiday calendars.  Run it standalone to
+seed the in-memory store and validate all pre-trade and post-trade risk checks:
+
+```bash
+source .venv/bin/activate
+
+# Full demo: loads all ref data, runs pre-trade checks on sample orders,
+# books fills, prints position report and post-trade violations
+python gbo_ref_data.py
+```
+
+What the demo prints:
+- Instrument master (ISIN, CUSIP, tick size, lot size, currency)
+- Counterparty / account / limit tables
+- Pre-trade risk results for 5 sample orders (PASS / WARN / BLOCK per check)
+- Post-trade position report with P&L, gross/net exposure, VaR
+- Any post-trade limit breaches with severity
+
+The `GBORefDataStore` class is imported by `pre_trade_risk/montecarlo_pricing.py`
+and the post-trade surveillance engine.  Always start GBO before the risk engines:
+
+```python
+from gbo_ref_data import GBORefDataStore, PreTradeRiskEngine
+
+gbo    = GBORefDataStore()
+engine = PreTradeRiskEngine(gbo)
+result = engine.check(order)
+```
+
+---
+
+**Terminal 3 — Send market data feed (NBBO / Trade / L2 Book)**
 
 ```bash
 source .venv/bin/activate

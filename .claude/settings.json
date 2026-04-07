@@ -22,6 +22,7 @@
       "Bash(clang -O2 -Wall dpdk_pcap.c -lpcap -o dpdk_pcap)",
       "Bash(.venv/bin/python send_market_data.py --count 5 --rate 0 --verbose)",
 <<<<<<< HEAD
+<<<<<<< HEAD
       "Bash(ls /Users/vamsi/aws/low_latency/.env*)",
       "Bash(.venv/bin/python -c ':*)",
       "Bash(sed -i '' 's/192\\\\.168\\\\.1\\\\.100/\\\\$MAC_A_IP/g' /Users/vamsi/aws/low_latency/README.md)",
@@ -31,6 +32,11 @@
       "Bash(.venv/bin/python -c \"from textual.app import App; print\\('textual OK'\\)\")",
       "Bash(.venv/bin/python -c \"import client.trader_ui\")"
 >>>>>>> 6fc009f (feat: Add Trader UI and GBO Ref Data)
+=======
+      "Bash(.venv/bin/python gbo_ref_data.py)",
+      "Bash(.venv/bin/python -c \"from textual.app import App; print\\('textual OK'\\)\")",
+      "Bash(.venv/bin/python -c \"import client.trader_ui\")"
+>>>>>>> 3df878c03f14b2784762481c6c1396d8175f5551
     ],
     "additionalDirectories": [
       "/Users/vamsi/aws/low_latency"
