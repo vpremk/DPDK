@@ -20,7 +20,10 @@
       "Bash(ipconfig getifaddr:*)",
       "Bash(ls /Users/vamsi/aws/low_latency/*.c /Users/vamsi/aws/low_latency/*.sh)",
       "Bash(clang -O2 -Wall dpdk_pcap.c -lpcap -o dpdk_pcap)",
-      "Bash(.venv/bin/python send_market_data.py --count 5 --rate 0 --verbose)"
+      "Bash(.venv/bin/python send_market_data.py --count 5 --rate 0 --verbose)",
+      "Bash(.venv/bin/python gbo_ref_data.py)",
+      "Bash(.venv/bin/python -c \"from textual.app import App; print\\('textual OK'\\)\")",
+      "Bash(.venv/bin/python -c \"import client.trader_ui\")"
     ],
     "additionalDirectories": [
       "/Users/vamsi/aws/low_latency"
