@@ -30,7 +30,7 @@ Key bindings:
 Usage:
   pip install textual
   python client/trader_ui.py
-  python client/trader_ui.py --dst 192.168.1.165 --port 4567
+  python client/trader_ui.py --dst 192.X.Y.X --port 4567
   python client/trader_ui.py --mode algo --rate 5 --count 50
 """
 

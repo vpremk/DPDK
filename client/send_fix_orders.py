@@ -2,7 +2,7 @@
 send_fix_orders.py — send FIX-over-UDP orders to en0 for dpdk_pcap to capture.
 
 On macOS, traffic from localhost to 127.x goes via lo0, not en0.
-To reach en0 (192.168.1.165) from the same machine we bind the socket
+To reach en0 (192.X.Y.X) from the same machine we bind the socket
 to en0's IP as source so the kernel routes it out en0.
 
 Usage:
@@ -12,7 +12,7 @@ Usage:
     # In terminal 2 (send):
     python send_fix_orders.py                        # 10 orders, default rate
     python send_fix_orders.py --count 100 --rate 50  # 100 orders at 50/sec
-    python send_fix_orders.py --dst 192.168.1.165    # explicit destination
+    python send_fix_orders.py --dst 192.X.Y.X    # explicit destination
 """
 
 import socket

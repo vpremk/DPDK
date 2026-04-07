@@ -17,7 +17,7 @@ Usage:
   python send_market_data.py --type nbbo --rate 100
   python send_market_data.py --type trade --count 200
   python send_market_data.py --type book --depth 5
-  python send_market_data.py --dst 192.168.1.165
+  python send_market_data.py --dst 192.X.Y.X
 
 Requires:
   pip install protobuf grpcio-tools
@@ -544,7 +544,7 @@ Examples:
   python send_market_data.py --type book --depth 10   # L2 snapshots
   python send_market_data.py --type delta --count 500 # incremental updates
   python send_market_data.py --mode decode            # receive + print decoded msgs
-  python send_market_data.py --dst 192.168.1.165      # send to Mac B
+  python send_market_data.py --dst 192.X.Y.X      # send to Mac B
 """)
     ap.add_argument("--mode",    choices=["send", "decode"], default="send")
     ap.add_argument("--dst",     default=None,
