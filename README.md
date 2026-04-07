@@ -104,7 +104,7 @@ audit log.
 ┌─────────────────────────────┐       1 Gbps Ethernet        ┌──────────────────────────────────────┐
 │          Mac A              │  ──────────────────────────► │             Mac B                    │
 │  (Order + MktData Sender)   │  FIX/UDP   port 4567         │  (DPDK-style Capture · libpcap/BPF)  │
-│  192.168.1.100              │  Proto/UDP port 5678         │  192.168.1.165                       │
+│  $MAC_A_IP              │  Proto/UDP port 5678         │  $MAC_B_IP                       │
 │  send_fix_orders.py         │  ~50–200 µs LAN RTT          │  dpdk_pcap  (C · libpcap)            │
 │  send_market_data.py        │                              │  dpdk_sim.py (Python simulation)     │
 └─────────────────────────────┘                              └──────────────────────────────────────┘
@@ -190,7 +190,8 @@ python client/send_market_data.py --mode decode --port 5678
 
 ### Mac A — Send FIX Orders and Market Data
 
-Replace `192.168.1.165` with Mac B's actual `en0` IP (`ipconfig getifaddr en0` on Mac B).
+Set `MAC_B_IP` in `.env` to Mac B's `en0` IP (`ipconfig getifaddr en0` on Mac B), then `source .env`.
+All scripts read `EMS_HOST` from the environment — no hardcoded IPs needed.
 
 **Terminal 1 — Send FIX 4.2 orders (NewOrderSingle + CancelRequest)**
 
@@ -198,13 +199,13 @@ Replace `192.168.1.165` with Mac B's actual `en0` IP (`ipconfig getifaddr en0` o
 source .venv/bin/activate
 
 # 10 orders at 5/sec — default
-python client/send_fix_orders.py --dst 192.168.1.165
+python client/send_fix_orders.py --dst $EMS_HOST
 
 # 500 orders at 50/sec with per-message print
-python client/send_fix_orders.py --dst 192.168.1.165 --count 500 --rate 50 --verbose
+python client/send_fix_orders.py --dst $EMS_HOST --count 500 --rate 50 --verbose
 
 # Max rate (stress test)
-python client/send_fix_orders.py --dst 192.168.1.165 --count 10000 --rate 0
+python client/send_fix_orders.py --dst $EMS_HOST --count 10000 --rate 0
 ```
 
 **Terminal 2 — Send market data feed (NBBO / Trade / L2 Book)**
@@ -213,16 +214,16 @@ python client/send_fix_orders.py --dst 192.168.1.165 --count 10000 --rate 0
 source .venv/bin/activate
 
 # Mixed feed: NBBO + Trade + Heartbeat at 10 msg/s
-python client/send_market_data.py --dst 192.168.1.165
+python client/send_market_data.py --dst $EMS_HOST
 
 # NBBO only at 1000 msg/s
-python client/send_market_data.py --dst 192.168.1.165 --type nbbo --rate 1000 --count 5000
+python client/send_market_data.py --dst $EMS_HOST --type nbbo --rate 1000 --count 5000
 
 # L2 book snapshots, 10 levels deep
-python client/send_market_data.py --dst 192.168.1.165 --type book --depth 10 --count 200
+python client/send_market_data.py --dst $EMS_HOST --type book --depth 10 --count 200
 
 # Incremental book deltas
-python client/send_market_data.py --dst 192.168.1.165 --type delta --count 1000 --rate 500
+python client/send_market_data.py --dst $EMS_HOST --type delta --count 1000 --rate 500
 ```
 
 **Terminal 3 — RDMA latency benchmark (same machine, shared-mem simulation)**
@@ -289,7 +290,7 @@ sequenceDiagram
     end
 
     APP->>APP: Build FIX 4.2 NewOrderSingle<br/>8=FIX.4.2|35=D|55=AAPL|38=500|44=189.50
-    APP->>SOCK: sendto(dst=192.168.1.165, port=4567)
+    APP->>SOCK: sendto(dst=$MAC_B_IP, port=4567)
     note over APP,SOCK: Source bound to en0 IP<br/>avoids lo0 loopback
 
     SOCK->>WIRE: UDP datagram<br/>Ethernet frame on wire
@@ -502,7 +503,7 @@ low_latency/
 python client/send_fix_orders.py --count 50 --rate 10 --verbose
 
 # Send to explicit IP at max rate
-python client/send_fix_orders.py --dst 192.168.1.165 --count 1000 --rate 0
+python client/send_fix_orders.py --dst $EMS_HOST --count 1000 --rate 0
 ```
 
 ### Mac B — Capture & Process

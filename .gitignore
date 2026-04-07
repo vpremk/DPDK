@@ -1,0 +1,9 @@
+.env
+.env.local
+__pycache__/
+*.pyc
+.venv/
+*.pcap
+*.log
+*.pdf
+dpdk_pcap
