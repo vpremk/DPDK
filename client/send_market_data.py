@@ -40,6 +40,8 @@ import struct
 import subprocess
 import sys
 import time
+
+from env import EMS_HOST, MKTDATA_PORT as _MKTDATA_PORT
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -53,7 +55,7 @@ except ImportError:
     print("       Run: python -m grpc_tools.protoc -I. --python_out=. market_data.proto\n")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-MKTDATA_PORT  = 5678
+MKTDATA_PORT  = _MKTDATA_PORT
 HEADER_FMT    = "!BI"      # 1-byte MsgType + 4-byte big-endian length
 HEADER_SIZE   = struct.calcsize(HEADER_FMT)   # = 5
 
@@ -547,9 +549,10 @@ Examples:
   python send_market_data.py --dst 192.X.Y.X      # send to Mac B
 """)
     ap.add_argument("--mode",    choices=["send", "decode"], default="send")
-    ap.add_argument("--dst",     default=None,
-                    help="Destination IP (default: auto-detect en0)")
-    ap.add_argument("--port",    type=int,   default=MKTDATA_PORT)
+    ap.add_argument("--dst",  default=None,
+                    help="EMS IP (env: EMS_HOST / MAC_B_IP, default: auto-detect en0)")
+    ap.add_argument("--port", type=int, default=MKTDATA_PORT,
+                    help="UDP port (env: MKTDATA_PORT, default: 5678)")
     ap.add_argument("--type",    default="mixed",
                     choices=["mixed", "nbbo", "trade", "book", "delta", "heartbeat"],
                     help="Message type to send")
@@ -565,7 +568,7 @@ Examples:
         run_decoder(args.port)
         return
 
-    dst = args.dst or _local_en0_ip() or "127.0.0.1"
+    dst = args.dst or EMS_HOST or _local_en0_ip() or "127.0.0.1"
     send_feed(dst, args.port, args.type, args.count,
               args.rate, args.depth, args.verbose)
 

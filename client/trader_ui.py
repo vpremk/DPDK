@@ -3,35 +3,28 @@ trader_ui.py — Trader Terminal (Textual TUI)
 =============================================
 Two trading modes selectable at runtime:
 
-  MANUAL  — trader fills in symbol / side / qty / price and hits F9 (or Enter)
-  ALGO    — fires the send_fix_orders burst loop in a background thread at a
-            configurable rate; trader can start / stop at any time
+  MANUAL  — trader fills in symbol / side / qty / price and hits F9
+  ALGO    — fires a burst loop in a background thread at a configurable rate
 
 Both modes build FIX 4.2 NewOrderSingle (MsgType=D) messages and send them
 as raw UDP datagrams to the EMS (dpdk_pcap) on port 4567.
 
-Layout:
-  ┌─ Header ──────────────────────────────────────────────────────────┐
-  │  TRADER TERMINAL   Mode: MANUAL / ALGO    EMS: ip:port   seq: N   │
-  ├─ Left panel ──────────┬─ Right panel ─────────────────────────────┤
-  │  (mode-specific form) │  ORDER BLOTTER                            │
-  │                       │  (live DataTable — newest on top)         │
-  ├─ Footer ──────────────┴───────────────────────────────────────────┤
-  │  key hints                                                         │
-  └───────────────────────────────────────────────────────────────────┘
-
-Key bindings:
-  Tab / t   — toggle MANUAL ↔ ALGO mode
-  F9        — submit order (MANUAL) / start algo (ALGO)
-  F10 / s   — stop algo (ALGO mode)
-  ctrl+c    — cancel selected blotter row (sends FIX CancelRequest)
-  ctrl+q    — quit
+EMS destination is read from environment / .env:
+    EMS_HOST  — Mac B IP   (default: MAC_B_IP from .env)
+    EMS_PORT  — FIX port   (default: FIX_PORT from .env, typically 4567)
 
 Usage:
-  pip install textual
-  python client/trader_ui.py
-  python client/trader_ui.py --dst 192.X.Y.X --port 4567
-  python client/trader_ui.py --mode algo --rate 5 --count 50
+    pip install textual
+    python client/trader_ui.py
+    python client/trader_ui.py --dst $EMS_HOST
+    python client/trader_ui.py --mode algo
+
+Key bindings:
+    Tab / t   toggle MANUAL ↔ ALGO
+    F9        submit (MANUAL) / start algo (ALGO)
+    F10       stop algo
+    Ctrl+C    cancel highlighted blotter row
+    Ctrl+Q    quit
 """
 
 from __future__ import annotations
@@ -39,45 +32,37 @@ from __future__ import annotations
 import argparse
 import random
 import socket
-import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from textual import on, work
+from env import EMS_HOST, FIX_PORT as _DEFAULT_FIX_PORT
+
+from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, ScrollableContainer
+from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.reactive import reactive
 from textual.widgets import (
-    Button,
-    DataTable,
-    Footer,
-    Header,
-    Input,
-    Label,
-    RadioButton,
-    RadioSet,
-    Select,
-    Static,
-    Switch,
+    Button, DataTable, Footer, Header,
+    Input, Label, RadioButton, RadioSet,
+    Select, Static, Switch,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-FIX_PORT = 4567
-SOH      = "\x01"
-SYMBOLS  = ["AAPL", "MSFT", "AMZN", "NVDA", "TSLA", "SPY", "QQQ", "META", "GOOG", "NFLX"]
+SOH     = "\x01"
+SYMBOLS = ["AAPL", "MSFT", "AMZN", "NVDA", "TSLA", "SPY", "QQQ", "META", "GOOG", "NFLX"]
 
-ORDER_TYPES  = [("Limit", "2"), ("Market", "1"), ("Stop", "3"), ("Stop-Limit", "4")]
-TIF_OPTIONS  = [("Day", "0"), ("GTC", "1"), ("IOC", "3"), ("FOK", "4")]
+ORDER_TYPES = [("Limit", "2"), ("Market", "1"), ("Stop", "3"), ("Stop-Limit", "4")]
+TIF_OPTIONS = [("Day", "0"), ("GTC", "1"), ("IOC", "3"), ("FOK", "4")]
 
-BLOTTER_COLS = ["#", "ClOrdID", "Symbol", "Side", "Qty", "Price", "Type", "Status", "Sent μs"]
+BLOTTER_COLS = ["#", "ClOrdID", "Symbol", "Side", "Qty", "Price", "Type", "Status", "µs"]
 
 
 class Mode(Enum):
@@ -86,47 +71,39 @@ class Mode(Enum):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX BUILDER  (reuses logic from send_fix_orders.py)
+# FIX BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fix_checksum(msg: str) -> str:
+def _checksum(msg: str) -> str:
     return f"{sum(ord(c) for c in msg) % 256:03d}"
 
 def build_new_order(seq: int, symbol: str, side: str, qty: int,
                     price: float, ord_type: str = "2", tif: str = "0") -> bytes:
     body = (
-        f"35=D{SOH}"
-        f"49=TRADER{SOH}"
-        f"56=EMS{SOH}"
+        f"35=D{SOH}49=TRADER{SOH}56=EMS{SOH}"
         f"34={seq}{SOH}"
         f"52={time.strftime('%Y%m%d-%H:%M:%S')}{SOH}"
         f"11=ORD{seq:06d}{SOH}"
-        f"55={symbol}{SOH}"
-        f"54={side}{SOH}"
-        f"38={qty}{SOH}"
-        f"44={price:.2f}{SOH}"
-        f"40={ord_type}{SOH}"
-        f"59={tif}{SOH}"
+        f"55={symbol}{SOH}54={side}{SOH}"
+        f"38={qty}{SOH}44={price:.2f}{SOH}"
+        f"40={ord_type}{SOH}59={tif}{SOH}"
     )
-    header = f"8=FIX.4.2{SOH}9={len(body)}{SOH}"
-    full   = header + body
-    return (full + f"10={fix_checksum(full)}{SOH}").encode()
+    hdr  = f"8=FIX.4.2{SOH}9={len(body)}{SOH}"
+    full = hdr + body
+    return (full + f"10={_checksum(full)}{SOH}").encode()
 
 def build_cancel(seq: int, orig_cl_ord_id: str, symbol: str, side: str) -> bytes:
     body = (
-        f"35=F{SOH}"
-        f"49=TRADER{SOH}"
-        f"56=EMS{SOH}"
+        f"35=F{SOH}49=TRADER{SOH}56=EMS{SOH}"
         f"34={seq}{SOH}"
         f"52={time.strftime('%Y%m%d-%H:%M:%S')}{SOH}"
         f"11=CXL{seq:06d}{SOH}"
         f"41={orig_cl_ord_id}{SOH}"
-        f"55={symbol}{SOH}"
-        f"54={side}{SOH}"
+        f"55={symbol}{SOH}54={side}{SOH}"
     )
-    header = f"8=FIX.4.2{SOH}9={len(body)}{SOH}"
-    full   = header + body
-    return (full + f"10={fix_checksum(full)}{SOH}").encode()
+    hdr  = f"8=FIX.4.2{SOH}9={len(body)}{SOH}"
+    full = hdr + body
+    return (full + f"10={_checksum(full)}{SOH}").encode()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,12 +115,12 @@ class OrderRecord:
     seq:       int
     cl_ord_id: str
     symbol:    str
-    side:      str       # "Buy" / "Sell"
+    side:      str        # "Buy" / "Sell"
     qty:       int
     price:     float
-    ord_type:  str       # label e.g. "Limit"
+    ord_type:  str        # label e.g. "Limit"
     status:    str = "SENT"
-    sent_us:   int = 0   # wire latency placeholder
+    sent_us:   int = 0
 
     @property
     def side_code(self) -> str:
@@ -154,113 +131,66 @@ class OrderRecord:
 # UDP SOCKET
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _en0_ip() -> str:
-    try:
-        out = subprocess.check_output(["ipconfig", "getifaddr", "en0"], text=True).strip()
-        import re
-        if re.match(r"\d+\.\d+\.\d+\.\d+", out):
-            return out
-    except Exception:
-        pass
-    return ""
-
 class FIXSocket:
     def __init__(self, dst: str, port: int):
         self.dst  = dst
         self.port = port
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        src = _en0_ip()
-        if src:
-            try:
-                self._sock.bind((src, 0))
-            except OSError:
-                pass
 
     def send(self, payload: bytes) -> int:
-        """Returns send latency in microseconds."""
         t0 = time.perf_counter_ns()
         self._sock.sendto(payload, (self.dst, self.port))
         return (time.perf_counter_ns() - t0) // 1_000
 
-    def close(self):
+    def close(self) -> None:
         self._sock.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSS
+# ─────────────────────────────────────────────────────────────────────────────
+
+APP_CSS = """
+Screen { layout: vertical; }
+
+#mode-bar {
+    height: 3; layout: horizontal; align: center middle;
+    background: $surface-darken-1; padding: 0 2;
+}
+#mode-bar Label { margin-right: 2; }
+#ems-info { dock: right; color: $text-muted; }
+
+#body { layout: horizontal; height: 1fr; }
+
+#manual-panel, #algo-panel {
+    width: 38; height: 100%; border: solid $primary-darken-2; padding: 1 2;
+}
+#algo-panel  { border: solid $accent-darken-2; }
+
+#manual-panel Label, #algo-panel Label { margin-bottom: 0; color: $text-muted; }
+#manual-panel Input,  #algo-panel Input  { margin-bottom: 1; }
+#manual-panel Select, #algo-panel Select { margin-bottom: 1; }
+
+#submit-btn    { width: 100%; margin-top: 1; }
+#algo-btn-row  { height: 3; margin-top: 1; }
+#algo-start-btn { width: 48%; }
+#algo-stop-btn  { width: 48%; }
+#algo-progress { height: 3; margin-top: 1; color: $success; }
+
+#blotter-panel { border: solid $surface-lighten-2; padding: 0 1; height: 100%; }
+#order-table   { height: 1fr; }
+"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PANELS
 # ─────────────────────────────────────────────────────────────────────────────
 
-MANUAL_CSS = """
-#manual-panel {
-    width: 36;
-    height: 100%;
-    border: solid $primary-darken-2;
-    padding: 1 2;
-}
-#manual-panel Label { margin-bottom: 0; color: $text-muted; }
-#manual-panel Input { margin-bottom: 1; }
-#manual-panel RadioSet { margin-bottom: 1; }
-#manual-panel Select { margin-bottom: 1; }
-#submit-btn { width: 100%; margin-top: 1; }
-"""
-
-ALGO_CSS = """
-#algo-panel {
-    width: 36;
-    height: 100%;
-    border: solid $accent-darken-2;
-    padding: 1 2;
-}
-#algo-panel Label { margin-bottom: 0; color: $text-muted; }
-#algo-panel Input { margin-bottom: 1; }
-#algo-panel Select { margin-bottom: 1; }
-#algo-start-btn { width: 48%; }
-#algo-stop-btn  { width: 48%; }
-#algo-btn-row   { height: 3; margin-top: 1; }
-#algo-progress  { height: 3; margin-top: 1; color: $success; }
-"""
-
-BLOTTER_CSS = """
-#blotter-panel {
-    border: solid $surface-lighten-2;
-    padding: 0 1;
-    height: 100%;
-}
-#order-table { height: 1fr; }
-"""
-
-APP_CSS = """
-Screen {
-    layout: vertical;
-}
-#body {
-    layout: horizontal;
-    height: 1fr;
-}
-#mode-bar {
-    height: 3;
-    layout: horizontal;
-    align: center middle;
-    background: $surface-darken-1;
-    padding: 0 2;
-}
-#mode-bar Label { margin-right: 2; }
-#mode-switch { margin-right: 1; }
-#ems-info { dock: right; color: $text-muted; }
-""" + MANUAL_CSS + ALGO_CSS + BLOTTER_CSS
-
-
 class ManualPanel(Vertical):
-    """Order entry form for MANUAL mode."""
-
     def compose(self) -> ComposeResult:
-        yield Label("─── Manual Order Entry ───")
+        yield Label("── Manual Order Entry ──")
         yield Label("Symbol")
-        yield Select(
-            [(s, s) for s in SYMBOLS],
-            value=SYMBOLS[0],
-            id="sym-select",
-        )
+        yield Select([(s, s) for s in SYMBOLS], value=SYMBOLS[0], id="sym-select")
         yield Label("Side")
         yield RadioSet(
             RadioButton("Buy",  value=True,  id="side-buy"),
@@ -268,57 +198,34 @@ class ManualPanel(Vertical):
             id="side-radio",
         )
         yield Label("Quantity")
-        yield Input(value="100", placeholder="shares", id="qty-input",
-                    restrict=r"[0-9]*")
+        yield Input(value="100", placeholder="shares", id="qty-input",   restrict=r"[0-9]*")
         yield Label("Price")
-        yield Input(value="100.00", placeholder="0.00", id="price-input",
-                    restrict=r"[0-9]*\.?[0-9]*")
+        yield Input(value="100.00", placeholder="0.00", id="price-input", restrict=r"[0-9]*\.?[0-9]*")
         yield Label("Order Type")
-        yield Select(
-            [(lbl, code) for lbl, code in ORDER_TYPES],
-            value="2",
-            id="ordtype-select",
-        )
+        yield Select([(l, c) for l, c in ORDER_TYPES], value="2", id="ordtype-select")
         yield Label("Time In Force")
-        yield Select(
-            [(lbl, code) for lbl, code in TIF_OPTIONS],
-            value="0",
-            id="tif-select",
-        )
+        yield Select([(l, c) for l, c in TIF_OPTIONS], value="0", id="tif-select")
         yield Button("Submit  [F9]", variant="primary", id="submit-btn")
 
 
 class AlgoPanel(Vertical):
-    """Configuration and controls for ALGO mode."""
-
-    running: reactive[bool] = reactive(False)
-
     def compose(self) -> ComposeResult:
-        yield Label("─── Algo Engine ───")
+        yield Label("── Algo Engine ──")
         yield Label("Symbol universe")
-        yield Select(
-            [("All symbols", "ALL")] + [(s, s) for s in SYMBOLS],
-            value="ALL",
-            id="algo-sym-select",
-        )
-        yield Label("Rate (orders / sec)")
-        yield Input(value="5", placeholder="e.g. 10", id="algo-rate-input",
-                    restrict=r"[0-9]*\.?[0-9]*")
-        yield Label("Count (0 = unlimited)")
-        yield Input(value="20", placeholder="e.g. 100", id="algo-count-input",
-                    restrict=r"[0-9]*")
+        yield Select([("All symbols", "ALL")] + [(s, s) for s in SYMBOLS],
+                     value="ALL", id="algo-sym-select")
+        yield Label("Rate  (orders / sec)")
+        yield Input(value="5",  placeholder="e.g. 10",  id="algo-rate-input",  restrict=r"[0-9]*\.?[0-9]*")
+        yield Label("Count  (0 = unlimited)")
+        yield Input(value="20", placeholder="e.g. 100", id="algo-count-input", restrict=r"[0-9]*")
         yield Label("Side bias")
-        yield Select(
-            [("Random", "random"), ("Buy only", "buy"), ("Sell only", "sell")],
-            value="random",
-            id="algo-side-select",
-        )
-        yield Label("Cancel every Nth (0 = off)")
-        yield Input(value="5", placeholder="0", id="algo-cancel-nth-input",
-                    restrict=r"[0-9]*")
+        yield Select([("Random", "random"), ("Buy only", "buy"), ("Sell only", "sell")],
+                     value="random", id="algo-side-select")
+        yield Label("Cancel every Nth  (0 = off)")
+        yield Input(value="5", placeholder="0", id="algo-cancel-nth-input", restrict=r"[0-9]*")
         with Horizontal(id="algo-btn-row"):
-            yield Button("▶ Start  [F9]", variant="success",  id="algo-start-btn")
-            yield Button("■ Stop  [F10]", variant="error",    id="algo-stop-btn")
+            yield Button("▶ Start  [F9]", variant="success", id="algo-start-btn")
+            yield Button("■ Stop  [F10]", variant="error",   id="algo-stop-btn")
         yield Static("", id="algo-progress")
 
     def on_mount(self) -> None:
@@ -326,10 +233,8 @@ class AlgoPanel(Vertical):
 
 
 class BlotterPanel(Vertical):
-    """Live order blotter."""
-
     def compose(self) -> ComposeResult:
-        yield Label("─── Order Blotter  (Ctrl+C = cancel selected) ───")
+        yield Label("── Order Blotter  (Ctrl+C = cancel selected) ──")
         yield DataTable(id="order-table", cursor_type="row", zebra_stripes=True)
 
     def on_mount(self) -> None:
@@ -339,21 +244,19 @@ class BlotterPanel(Vertical):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN APP
+# APP
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TraderApp(App):
-    """Trader terminal — FIX order entry with Manual / Algo mode."""
-
     CSS = APP_CSS
 
     BINDINGS = [
-        Binding("t",      "toggle_mode",   "Toggle Mode",    show=True),
-        Binding("tab",    "toggle_mode",   "Toggle Mode",    show=False),
-        Binding("f9",     "submit",        "Submit / Start", show=True),
-        Binding("f10",    "stop_algo",     "Stop Algo",      show=True),
-        Binding("ctrl+c", "cancel_order",  "Cancel Order",   show=True),
-        Binding("ctrl+q", "quit",          "Quit",           show=True),
+        Binding("t",      "toggle_mode",  "Toggle Mode",    show=True),
+        Binding("tab",    "toggle_mode",  "Toggle Mode",    show=False),
+        Binding("f9",     "submit",       "Submit / Start", show=True),
+        Binding("f10",    "stop_algo",    "Stop Algo",      show=True),
+        Binding("ctrl+c", "cancel_order", "Cancel Order",   show=True),
+        Binding("ctrl+q", "quit",         "Quit",           show=True),
     ]
 
     mode: reactive[Mode] = reactive(Mode.MANUAL)
@@ -361,13 +264,13 @@ class TraderApp(App):
 
     def __init__(self, dst: str, port: int, start_mode: Mode):
         super().__init__()
-        self.dst        = dst
-        self.port       = port
-        self._fix       = FIXSocket(dst, port)
-        self._orders:  list[OrderRecord] = []
-        self._algo_stop = threading.Event()
+        self.dst          = dst
+        self.port         = port
+        self._fix         = FIXSocket(dst, port)
+        self._orders:     list[OrderRecord] = []
+        self._algo_stop   = threading.Event()
         self._algo_thread: Optional[threading.Thread] = None
-        self.mode = start_mode
+        self.mode         = start_mode
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
@@ -376,9 +279,9 @@ class TraderApp(App):
         with Horizontal(id="mode-bar"):
             yield Label("Mode:")
             yield Switch(value=(self.mode == Mode.ALGO), id="mode-switch")
-            yield Label("MANUAL", id="mode-label-manual")
-            yield Label(" / ", id="mode-sep")
-            yield Label("ALGO",   id="mode-label-algo")
+            yield Label("MANUAL", id="lbl-manual")
+            yield Label(" / ")
+            yield Label("ALGO",   id="lbl-algo")
             yield Label(f"EMS → {self.dst}:{self.port}", id="ems-info")
         with Horizontal(id="body"):
             if self.mode == Mode.MANUAL:
@@ -389,9 +292,8 @@ class TraderApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.title    = "Trader Terminal"
-        self.sub_title = f"FIX 4.2 → EMS {self.dst}:{self.port}"
-        self._refresh_mode_labels()
+        self.title     = "Trader Terminal"
+        self.sub_title = f"FIX 4.2  EMS {self.dst}:{self.port}"
 
     # ── Mode toggle ───────────────────────────────────────────────────────────
 
@@ -401,9 +303,10 @@ class TraderApp(App):
             return
         self.mode = Mode.ALGO if self.mode == Mode.MANUAL else Mode.MANUAL
         self._swap_left_panel()
-        self._refresh_mode_labels()
-        sw = self.query_one("#mode-switch", Switch)
-        sw.value = (self.mode == Mode.ALGO)
+        try:
+            self.query_one("#mode-switch", Switch).value = (self.mode == Mode.ALGO)
+        except NoMatches:
+            pass
 
     @on(Switch.Changed, "#mode-switch")
     def _on_switch(self, event: Switch.Changed) -> None:
@@ -413,37 +316,21 @@ class TraderApp(App):
             return
         self.mode = Mode.ALGO if event.value else Mode.MANUAL
         self._swap_left_panel()
-        self._refresh_mode_labels()
 
     def _swap_left_panel(self) -> None:
         body = self.query_one("#body", Horizontal)
-        try:
-            body.query_one("#manual-panel").remove()
-        except NoMatches:
-            pass
-        try:
-            body.query_one("#algo-panel").remove()
-        except NoMatches:
-            pass
+        for sel in ("#manual-panel", "#algo-panel"):
+            try:
+                body.query_one(sel).remove()
+            except NoMatches:
+                pass
+        blotter = body.query_one("#blotter-panel")
         if self.mode == Mode.MANUAL:
-            body.mount(ManualPanel(id="manual-panel"), before=body.query_one("#blotter-panel"))
+            body.mount(ManualPanel(id="manual-panel"), before=blotter)
         else:
-            body.mount(AlgoPanel(id="algo-panel"),   before=body.query_one("#blotter-panel"))
+            body.mount(AlgoPanel(id="algo-panel"),     before=blotter)
 
-    def _refresh_mode_labels(self) -> None:
-        try:
-            m = self.query_one("#mode-label-manual", Label)
-            a = self.query_one("#mode-label-algo",   Label)
-            if self.mode == Mode.MANUAL:
-                m.add_class("text-success")
-                a.remove_class("text-success")
-            else:
-                a.add_class("text-success")
-                m.remove_class("text-success")
-        except NoMatches:
-            pass
-
-    # ── Submit action — delegates to mode ─────────────────────────────────────
+    # ── Submit dispatcher ─────────────────────────────────────────────────────
 
     def action_submit(self) -> None:
         if self.mode == Mode.MANUAL:
@@ -451,70 +338,60 @@ class TraderApp(App):
         else:
             self._start_algo()
 
-    # ── MANUAL: read form → send single FIX order ────────────────────────────
+    # ── Manual submit ─────────────────────────────────────────────────────────
 
     def _submit_manual(self) -> None:
         try:
-            symbol   = str(self.query_one("#sym-select",      Select).value)
-            radio    = self.query_one("#side-radio",           RadioSet)
+            symbol   = str(self.query_one("#sym-select",    Select).value)
+            radio    = self.query_one("#side-radio",         RadioSet)
             side     = "Buy" if radio.pressed_index == 0 else "Sell"
             side_c   = "1"   if side == "Buy"          else "2"
-            qty_raw  = self.query_one("#qty-input",            Input).value.strip()
-            px_raw   = self.query_one("#price-input",          Input).value.strip()
-            ord_type = str(self.query_one("#ordtype-select",   Select).value)
-            tif      = str(self.query_one("#tif-select",       Select).value)
-        except NoMatches:
-            self.notify("Form not ready", severity="error")
+            qty      = int(self.query_one("#qty-input",      Input).value.strip() or "0")
+            price    = float(self.query_one("#price-input",  Input).value.strip() or "0")
+            ord_type = str(self.query_one("#ordtype-select", Select).value)
+            tif      = str(self.query_one("#tif-select",     Select).value)
+        except (NoMatches, ValueError) as e:
+            self.notify(f"Form error: {e}", severity="error")
             return
 
-        if not qty_raw or not px_raw:
-            self.notify("Qty and Price are required", severity="warning")
+        if qty <= 0 or price <= 0:
+            self.notify("Qty and Price must be > 0", severity="warning")
             return
 
-        qty   = int(qty_raw)
-        price = float(px_raw)
         ord_lbl = next(l for l, c in ORDER_TYPES if c == ord_type)
-
         self.seq += 1
-        payload  = build_new_order(self.seq, symbol, side_c, qty, price,
-                                   ord_type, tif)
+        payload  = build_new_order(self.seq, symbol, side_c, qty, price, ord_type, tif)
         lat_us   = self._fix.send(payload)
 
         rec = OrderRecord(self.seq, f"ORD{self.seq:06d}", symbol,
                           side, qty, price, ord_lbl, "SENT", lat_us)
         self._add_to_blotter(rec)
-        self.notify(f"✓ {side} {qty} {symbol} @ {price:.2f}  [{lat_us} µs]",
+        self.notify(f"✓ {side} {qty} {symbol} @ {price:.2f}  ({lat_us} µs)",
                     severity="information")
 
     @on(Button.Pressed, "#submit-btn")
     def _on_submit_btn(self) -> None:
         self._submit_manual()
 
-    # ── ALGO: background thread burst ────────────────────────────────────────
+    # ── Algo burst ────────────────────────────────────────────────────────────
 
     def _start_algo(self) -> None:
         if self._algo_running():
             self.notify("Algo already running", severity="warning")
             return
         try:
-            sym_val  = str(self.query_one("#algo-sym-select",    Select).value)
-            rate_raw = self.query_one("#algo-rate-input",         Input).value.strip()
-            cnt_raw  = self.query_one("#algo-count-input",        Input).value.strip()
-            side_val = str(self.query_one("#algo-side-select",    Select).value)
-            nth_raw  = self.query_one("#algo-cancel-nth-input",   Input).value.strip()
-        except NoMatches:
+            sym_val    = str(self.query_one("#algo-sym-select",    Select).value)
+            rate       = float(self.query_one("#algo-rate-input",   Input).value or "5")
+            count      = int(self.query_one("#algo-count-input",    Input).value or "0")
+            side_val   = str(self.query_one("#algo-side-select",    Select).value)
+            cancel_nth = int(self.query_one("#algo-cancel-nth-input", Input).value or "0")
+        except (NoMatches, ValueError):
             return
 
-        rate   = float(rate_raw) if rate_raw else 5.0
-        count  = int(cnt_raw)    if cnt_raw  else 0
-        cancel_nth = int(nth_raw) if nth_raw else 0
         sym_pool = SYMBOLS if sym_val == "ALL" else [sym_val]
-
         try:
-            btn_start = self.query_one("#algo-start-btn", Button)
-            btn_stop  = self.query_one("#algo-stop-btn",  Button)
-            btn_start.disabled = True
-            btn_stop.disabled  = False
+            self.query_one("#algo-start-btn", Button).disabled = True
+            self.query_one("#algo-stop-btn",  Button).disabled = False
         except NoMatches:
             pass
 
@@ -536,9 +413,9 @@ class TraderApp(App):
         while not self._algo_stop.is_set():
             if count > 0 and sent >= count:
                 break
-
-            sent += 1
+            sent  += 1
             symbol = rng.choice(sym_pool)
+
             if side_val == "buy":
                 side, side_c = "Buy",  "1"
             elif side_val == "sell":
@@ -549,13 +426,12 @@ class TraderApp(App):
             qty   = rng.randint(100, 5000)
             price = round(rng.uniform(50, 500), 2)
 
-            # atomically bump seq
             self.seq += 1
             seq = self.seq
 
             if cancel_nth > 0 and sent % cancel_nth == 0 and sent > 1:
-                orig_id = f"ORD{(seq - 1):06d}"
-                payload = build_cancel(seq, orig_id, symbol, side_c)
+                orig = f"ORD{(seq - 1):06d}"
+                payload = build_cancel(seq, orig, symbol, side_c)
                 lat_us  = self._fix.send(payload)
                 rec = OrderRecord(seq, f"CXL{seq:06d}", symbol,
                                   side, qty, price, "Cancel", "SENT", lat_us)
@@ -565,13 +441,11 @@ class TraderApp(App):
                 rec = OrderRecord(seq, f"ORD{seq:06d}", symbol,
                                   side, qty, price, "Limit", "SENT", lat_us)
 
-            # cross thread → schedule UI update on main loop
             self.call_from_thread(self._add_to_blotter, rec)
             self.call_from_thread(self._update_algo_progress, sent, count, rate)
 
             if interval > 0:
-                nxt = start + sent * interval
-                slp = nxt - time.perf_counter()
+                slp = (start + sent * interval) - time.perf_counter()
                 if slp > 0:
                     time.sleep(slp)
 
@@ -587,10 +461,9 @@ class TraderApp(App):
 
     def _update_algo_progress(self, sent: int, total: int, rate: float) -> None:
         try:
-            bar = self.query_one("#algo-progress", Static)
             label = f"▶ {sent}" + (f"/{total}" if total > 0 else "") + \
-                    f" orders  @ {rate:.0f}/s  seq={self.seq}"
-            bar.update(label)
+                    f"  @ {rate:.0f}/s  seq={self.seq}"
+            self.query_one("#algo-progress", Static).update(label)
         except NoMatches:
             pass
 
@@ -606,8 +479,7 @@ class TraderApp(App):
         self.action_stop_algo()
 
     def _algo_running(self) -> bool:
-        return (self._algo_thread is not None and
-                self._algo_thread.is_alive())
+        return self._algo_thread is not None and self._algo_thread.is_alive()
 
     # ── Cancel selected blotter row ───────────────────────────────────────────
 
@@ -616,30 +488,25 @@ class TraderApp(App):
             tbl = self.query_one("#order-table", DataTable)
         except NoMatches:
             return
-        if tbl.cursor_row < 0 or tbl.cursor_row >= len(self._orders):
+        if not self._orders or tbl.cursor_row < 0:
             return
 
-        # Blotter is newest-first so invert index
-        idx = len(self._orders) - 1 - tbl.cursor_row
-        rec = self._orders[idx]
-        if rec.status in ("CANCELLED", "FILLED"):
-            self.notify(f"{rec.cl_ord_id} already {rec.status}", severity="warning")
+        rec = self._orders[tbl.cursor_row]
+        if rec.status in ("CANCELLED", "CANCEL→EMS"):
+            self.notify(f"{rec.cl_ord_id} already cancelled", severity="warning")
             return
 
         self.seq += 1
-        payload = build_cancel(self.seq, rec.cl_ord_id, rec.symbol, rec.side_code)
-        lat_us  = self._fix.send(payload)
-
-        cancel_rec = OrderRecord(
-            self.seq, f"CXL{self.seq:06d}", rec.symbol,
-            rec.side, rec.qty, rec.price, "Cancel", "SENT", lat_us,
-        )
+        lat_us = self._fix.send(build_cancel(self.seq, rec.cl_ord_id,
+                                             rec.symbol, rec.side_code))
+        cancel_rec = OrderRecord(self.seq, f"CXL{self.seq:06d}", rec.symbol,
+                                 rec.side, rec.qty, rec.price, "Cancel", "SENT", lat_us)
         rec.status = "CANCEL→EMS"
         self._add_to_blotter(cancel_rec)
-        self._refresh_blotter()
+        self._refresh_statuses()
         self.notify(f"↩ Cancel sent for {rec.cl_ord_id}", severity="warning")
 
-    # ── Blotter helpers ───────────────────────────────────────────────────────
+    # ── Blotter ───────────────────────────────────────────────────────────────
 
     def _add_to_blotter(self, rec: OrderRecord) -> None:
         self._orders.append(rec)
@@ -647,37 +514,26 @@ class TraderApp(App):
             tbl = self.query_one("#order-table", DataTable)
         except NoMatches:
             return
-
-        side_styled = (
-            f"[green]{rec.side}[/green]" if rec.side == "Buy"
-            else f"[red]{rec.side}[/red]"
-        )
+        side_txt = (f"[green]{rec.side}[/green]" if rec.side == "Buy"
+                    else f"[red]{rec.side}[/red]")
         tbl.add_row(
-            str(rec.seq),
-            rec.cl_ord_id,
-            rec.symbol,
-            side_styled,
-            str(rec.qty),
-            f"{rec.price:.2f}",
-            rec.ord_type,
-            rec.status,
-            f"{rec.sent_us}",
+            str(rec.seq), rec.cl_ord_id, rec.symbol, side_txt,
+            str(rec.qty), f"{rec.price:.2f}", rec.ord_type,
+            rec.status, str(rec.sent_us),
             key=str(rec.seq),
         )
-        # scroll to newest (last added = top of reversed view if we insert at top)
         tbl.move_cursor(row=tbl.row_count - 1)
 
-    def _refresh_blotter(self) -> None:
-        """Repaint status cells for orders whose status changed."""
+    def _refresh_statuses(self) -> None:
         try:
             tbl = self.query_one("#order-table", DataTable)
+            for rec in self._orders:
+                try:
+                    tbl.update_cell(str(rec.seq), "Status", rec.status)
+                except Exception:
+                    pass
         except NoMatches:
-            return
-        for rec in self._orders:
-            try:
-                tbl.update_cell(str(rec.seq), "Status", rec.status)
-            except Exception:
-                pass
+            pass
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
@@ -691,27 +547,26 @@ class TraderApp(App):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    en0 = _en0_ip() or "127.0.0.1"
-    ap  = argparse.ArgumentParser(
-        description="Trader TUI — FIX 4.2 orders to EMS over UDP",
+    ap = argparse.ArgumentParser(
+        description="Trader TUI — FIX 4.2 to EMS via UDP",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Key bindings inside the TUI:
-  Tab / t   toggle MANUAL ↔ ALGO mode
-  F9        submit order (MANUAL) / start algo (ALGO)
-  F10       stop algo
-  Ctrl+C    cancel highlighted blotter row
-  Ctrl+Q    quit
+Environment variables (set in .env):
+  EMS_HOST   — EMS IP  (default: MAC_B_IP)
+  EMS_PORT   — FIX UDP port  (default: FIX_PORT = 4567)
 """)
-    ap.add_argument("--dst",   default=en0,       help="EMS IP (default: en0)")
-    ap.add_argument("--port",  type=int, default=FIX_PORT)
-    ap.add_argument("--mode",  choices=["manual", "algo"], default="manual",
-                    help="Starting mode")
+    ap.add_argument("--dst",  default=EMS_HOST,
+                    help="EMS IP (env: EMS_HOST, default from .env)")
+    ap.add_argument("--port", type=int, default=_DEFAULT_FIX_PORT,
+                    help="FIX UDP port (env: FIX_PORT, default: 4567)")
+    ap.add_argument("--mode", choices=["manual", "algo"], default="manual")
     args = ap.parse_args()
 
-    start_mode = Mode.ALGO if args.mode == "algo" else Mode.MANUAL
-    app = TraderApp(dst=args.dst, port=args.port, start_mode=start_mode)
-    app.run()
+    TraderApp(
+        dst=args.dst,
+        port=args.port,
+        start_mode=Mode.ALGO if args.mode == "algo" else Mode.MANUAL,
+    ).run()
 
 
 if __name__ == "__main__":
