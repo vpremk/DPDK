@@ -14,6 +14,7 @@ EMS destination is read from environment / .env:
     EMS_PORT  — FIX port   (default: FIX_PORT from .env, typically 4567)
 
 Usage:
+<<<<<<< HEAD
     pip install textual
     python client/trader_ui.py
     python client/trader_ui.py --dst $EMS_HOST
@@ -25,6 +26,12 @@ Key bindings:
     F10       stop algo
     Ctrl+C    cancel highlighted blotter row
     Ctrl+Q    quit
+=======
+  pip install textual
+  python client/trader_ui.py
+  python client/trader_ui.py --dst 192.X.Y.X --port 4567
+  python client/trader_ui.py --mode algo --rate 5 --count 50
+>>>>>>> f879d07 (chore: cleanup)
 """
 
 from __future__ import annotations
