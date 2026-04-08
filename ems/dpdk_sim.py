@@ -18,6 +18,8 @@ Concepts implemented:
   10. Multi-Queue  → RSS simulation (Receive Side Scaling)
 """
 
+import sys
+import os
 import time
 import struct
 import random
@@ -27,6 +29,13 @@ import statistics
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 from enum import IntEnum
+
+# Allow importing gbo_ref_data from the project root
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from gbo_ref_data import (
+    GBORefDataStore, PreTradeRiskEngine, Order as GBOOrder,
+    OrderSide, RiskResult,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -849,6 +858,93 @@ class LcorePipeline:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 11b. PRE-TRADE RISK GATEWAY — FIX → GBO Order → Risk Engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PreTradeRiskGateway:
+    """
+    Bridges the FIX packet pipeline to the GBO pre-trade risk engine.
+
+    Responsibilities:
+      - Map FIX SenderCompID to a GBO account_id and counterparty cp_id
+      - Translate FIXMsg → GBOOrder (the risk engine's order type)
+      - Call PreTradeRiskEngine.check() and return the verdict
+      - Accumulate pass/warn/reject counters for stats reporting
+
+    In production this would run on a dedicated risk lcore, receiving
+    orders from the OMS ingress ring via zero-copy pointer passing.
+    """
+
+    # FIX SenderCompID → (account_id, cp_id)
+    _SENDER_MAP: dict[str, tuple[str, str]] = {
+        "ALGO1": ("ACC-EQARB-01", "CP001"),   # EquityArb US  → Goldman (Tier1)
+        "ALGO2": ("ACC-EQARB-02", "CP002"),   # EquityArb EU  → Morgan Stanley (Tier1)
+        "OMS1":  ("ACC-AGENCY-01", "CP001"),  # Agency flow   → Goldman (Tier1)
+        "DESK1": ("ACC-MACRO-01",  "CP004"),  # Macro desk    → Deutsche Bank (Tier2)
+    }
+    _DEFAULT_ACCOUNT = "ACC-EQARB-01"
+    _DEFAULT_CP      = "CP001"
+
+    def __init__(self):
+        self._gbo    = GBORefDataStore()
+        self._engine = PreTradeRiskEngine(self._gbo)
+        self.n_pass   = 0
+        self.n_warn   = 0
+        self.n_reject = 0
+
+    def evaluate(self, proc: "ProcessedOrder"):
+        """
+        Run pre-trade risk checks on a decoded FIX order.
+        Returns (GBOOrder, PreTradeResult).
+        """
+        fix = proc.fix_msg
+        account_id, cp_id = self._SENDER_MAP.get(
+            fix.sender, (self._DEFAULT_ACCOUNT, self._DEFAULT_CP))
+
+        order = GBOOrder(
+            order_id    = fix.order_id,
+            account_id  = account_id,
+            cp_id       = cp_id,
+            ticker      = fix.symbol,
+            side        = OrderSide.BUY if fix.side == "1" else OrderSide.SELL,
+            qty         = int(fix.qty),
+            limit_price = fix.price,
+        )
+        result = self._engine.check(order)
+
+        if result.verdict == RiskResult.PASS:
+            self.n_pass += 1
+        elif result.verdict == RiskResult.WARN:
+            self.n_warn += 1
+        else:
+            self.n_reject += 1
+
+        return order, result
+
+    def print_result(self, order: "GBOOrder", result) -> None:
+        """Print a single risk decision to stdout."""
+        verdict_tag = {
+            RiskResult.PASS:   "✓ PASS  ",
+            RiskResult.WARN:   "⚠ WARN  ",
+            RiskResult.REJECT: "✗ REJECT",
+        }[result.verdict]
+        side_str = "BUY " if order.side == OrderSide.BUY else "SELL"
+        print(f"  {verdict_tag} | {order.order_id}  {side_str} {order.qty:>6,} "
+              f"{order.ticker:<6} @ {order.limit_price:>8.2f}"
+              f"  notional=${result.notional_usd:>12,.0f}"
+              f"  lat={result.latency_us:.1f}µs")
+        for chk in result.checks:
+            if chk.result != RiskResult.PASS:
+                tag = "  WARN" if chk.result == RiskResult.WARN else "  REJECT"
+                print(f"           {tag}: [{chk.name}] {chk.message}")
+
+    def stats_line(self) -> str:
+        total = self.n_pass + self.n_warn + self.n_reject
+        return (f"Risk gateway: {total} orders | "
+                f"pass={self.n_pass} warn={self.n_warn} reject={self.n_reject}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN — wire everything together and run
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -872,6 +968,7 @@ def main():
     processor = PacketProcessor()
     oms_ring  = RingBuffer("oms_ingress", RING_SIZE * 2)
     stats     = StatsEngine()
+    risk_gw   = PreTradeRiskGateway()
 
     # ── Launch one lcore per queue
     print(f"\n[EAL] Launching {RSS_QUEUES} lcore pipelines...")
@@ -895,9 +992,11 @@ def main():
         # Simulate NIC DMA filling RX rings
         pmd.fill_rx_queues(burst=RTE_ETH_RX_BURST_MAX)
 
-        # Drain OMS ingress ring (would feed into OMS state machine)
+        # Drain OMS ingress ring → pre-trade risk check → accepted/rejected log
         orders = oms_ring.dequeue_burst(64)
-        order_log.extend(orders)
+        for o in orders:
+            gbo_order, risk_result = risk_gw.evaluate(o)
+            order_log.append((o, gbo_order, risk_result))
 
         time.sleep(0.001)   # 1ms tick (remove for true busy-poll)
 
@@ -908,11 +1007,18 @@ def main():
     # ── Final stats
     stats.report(pmd, processor)
 
-    # ── Sample decoded orders
-    print(f"\n  Sample decoded FIX orders (first 8 of {len(order_log)}):")
+    # ── Pre-trade risk summary
+    print(f"\n  Pre-Trade Risk Gateway:")
     print(f"  {'─'*70}")
-    for o in order_log[:8]:
-        print(f"  Q{o.queue_id} | lat={o.latency_ns//1000:>5}µs | {o.fix_msg}")
+    print(f"  {risk_gw.stats_line()}")
+
+    # ── Sample decoded orders with risk decisions (first 8)
+    print(f"\n  Sample FIX orders + risk verdict (first 8 of {len(order_log)}):")
+    print(f"  {'─'*70}")
+    for proc_order, gbo_order, risk_result in order_log[:8]:
+        print(f"  Q{proc_order.queue_id} | nic_lat={proc_order.latency_ns//1000:>5}µs | "
+              f"{proc_order.fix_msg}")
+        risk_gw.print_result(gbo_order, risk_result)
 
     # ── RSS distribution
     print(f"\n  RSS Queue Distribution:")
