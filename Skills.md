@@ -18,6 +18,9 @@ HFT / institutional trading on AWS EC2 Nitro + EFA.
 | **Lock-free SPSC ring** — enqueue/dequeue, capacity, drop counting | `ems/dpdk_sim.py` `RingBuffer` |
 | **Receive-Side Scaling (RSS)** — Toeplitz hash, flow affinity across queues | `ems/dpdk_sim.py` `RSSMapper` |
 | **libpcap + C** — raw frame capture, BPF socket filter, pcap_loop | `ems/dpdk_pcap.c` |
+| **IP Multicast** — `IP_ADD_MEMBERSHIP`, `SO_REUSEPORT` multi-receiver, `IP_MULTICAST_LOOP` / TTL tuning for macOS loopback | `ems/multicast_gateway.py` |
+| **Multicast order fan-out** — `MulticastGateway` publish path, `MulticastEnvelope` wire format (struct.pack, no protobuf), PASS/WARN verdict filtering | `ems/multicast_gateway.py` |
+| **Sequence gap detection** — per-receiver monotonic seq_no tracking, gap counter; mirrors OPRA / CME Globex MDP3 feed-handler retransmission logic | `ems/multicast_gateway.py` `MulticastReceiver` |
 
 ---
 
@@ -88,3 +91,4 @@ HFT / institutional trading on AWS EC2 Nitro + EFA.
 | **Thread-per-lcore model** — daemon threads, busy-poll loop, no sleep | `ems/dpdk_sim.py` `LcorePipeline` |
 | **Interactive TUI** — Textual-based trader UI, manual and algo order modes | `client/trader_ui.py` |
 | **Perf instrumentation** — `time.perf_counter` latency timers, p50/p99 histograms | `ems/dpdk_sim.py` `StatsEngine` |
+| **Daemon thread receiver model** — `MulticastReceiver` per-node thread, `settimeout(0.1)` poll loop for clean shutdown | `ems/multicast_gateway.py` |

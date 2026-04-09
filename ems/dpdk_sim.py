@@ -970,6 +970,26 @@ def main():
     stats     = StatsEngine()
     risk_gw   = PreTradeRiskGateway()
 
+    # ── Multicast gateway — fan-out approved orders to N downstream receivers
+    print("\n[Mcast] Initialising multicast gateway...")
+    try:
+        from multicast_gateway import MulticastGateway, MulticastReceiver, RECEIVER_RING_SIZE
+        mcast_gw   = MulticastGateway()
+        N_RECEIVERS = 3
+        mcast_rings = [RingBuffer(f"mcast_rx_{i}", RECEIVER_RING_SIZE)
+                       for i in range(N_RECEIVERS)]
+        mcast_rxs   = [MulticastReceiver(receiver_id=i,
+                                         downstream_ring=mcast_rings[i],
+                                         gateway=mcast_gw)
+                       for i in range(N_RECEIVERS)]
+        for rx in mcast_rxs:
+            rx.start()
+        _mcast_enabled = True
+    except Exception as e:
+        print(f"  [mcast] disabled: {e}")
+        mcast_gw, mcast_rings, mcast_rxs = None, [], []
+        _mcast_enabled = False
+
     # ── Launch one lcore per queue
     print(f"\n[EAL] Launching {RSS_QUEUES} lcore pipelines...")
     lcores = []
@@ -992,17 +1012,27 @@ def main():
         # Simulate NIC DMA filling RX rings
         pmd.fill_rx_queues(burst=RTE_ETH_RX_BURST_MAX)
 
-        # Drain OMS ingress ring → pre-trade risk check → accepted/rejected log
+        # Drain OMS ingress ring → pre-trade risk check → multicast fan-out
         orders = oms_ring.dequeue_burst(64)
         for o in orders:
             gbo_order, risk_result = risk_gw.evaluate(o)
             order_log.append((o, gbo_order, risk_result))
+
+            # Publish approved orders to multicast group
+            if _mcast_enabled:
+                mcast_gw.publish(gbo_order, risk_result, o)
 
         time.sleep(0.001)   # 1ms tick (remove for true busy-poll)
 
     # ── Stop lcores
     for lc in lcores:
         lc.stop()
+
+    # ── Stop multicast receivers and close gateway
+    if _mcast_enabled:
+        for rx in mcast_rxs:
+            rx.stop()
+        mcast_gw.close()
 
     # ── Final stats
     stats.report(pmd, processor)
@@ -1011,6 +1041,14 @@ def main():
     print(f"\n  Pre-Trade Risk Gateway:")
     print(f"  {'─'*70}")
     print(f"  {risk_gw.stats_line()}")
+
+    # ── Multicast gateway summary
+    if _mcast_enabled:
+        print(f"\n  Multicast Gateway:")
+        print(f"  {'─'*70}")
+        print(f"  {mcast_gw.stats_line()}")
+        for rx in mcast_rxs:
+            print(f"  {rx.stats_line()}")
 
     # ── Sample decoded orders with risk decisions (first 8)
     print(f"\n  Sample FIX orders + risk verdict (first 8 of {len(order_log)}):")
